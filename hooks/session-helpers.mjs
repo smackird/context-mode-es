@@ -121,6 +121,18 @@ export function getSessionEventsPath(opts = CLAUDE_OPTS) {
 }
 
 /**
+ * Return the per-project ES session index name.
+ * Format: ctx-sessions-{platform}-{SHA256(projectDir)[:16]}
+ * This is the ES equivalent of getSessionDBPath() — use for new ES-backed code.
+ */
+export function getSessionIndexName(opts = CLAUDE_OPTS) {
+  const projectDir = getProjectDir(opts);
+  const hash = createHash("sha256").update(projectDir).digest("hex").slice(0, 16);
+  const platform = opts.configDir.replace(/^\./, "").toLowerCase();
+  return `ctx-sessions-${platform}-${hash}`;
+}
+
+/**
  * Return the per-project cleanup flag path.
  * Used to detect true fresh starts vs --continue (which fires startup+resume).
  * Path: ~/<configDir>/context-mode/sessions/<SHA256(projectDir)[:16]>.cleanup

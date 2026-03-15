@@ -20,6 +20,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { computeProjectHash, buildSessionIndexName } from "../es-index-naming.js";
 import {
   readFileSync,
   writeFileSync,
@@ -241,6 +242,14 @@ export class GeminiCLIAdapter implements HookAdapter {
       .digest("hex")
       .slice(0, 16);
     return join(this.getSessionDir(), `${hash}-events.md`);
+  }
+
+  getIndexPlatformId(): string {
+    return "gemini-cli";
+  }
+
+  getSessionIndexName(projectDir: string): string {
+    return buildSessionIndexName(this.getIndexPlatformId(), computeProjectHash(projectDir));
   }
 
   generateHookConfig(pluginRoot: string): HookRegistration {

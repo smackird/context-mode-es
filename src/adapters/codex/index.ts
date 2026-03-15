@@ -13,6 +13,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { computeProjectHash, buildSessionIndexName } from "../es-index-naming.js";
 import {
   readFileSync,
   writeFileSync,
@@ -125,6 +126,14 @@ export class CodexAdapter implements HookAdapter {
       .digest("hex")
       .slice(0, 16);
     return join(this.getSessionDir(), `${hash}-events.md`);
+  }
+
+  getIndexPlatformId(): string {
+    return "codex";
+  }
+
+  getSessionIndexName(projectDir: string): string {
+    return buildSessionIndexName(this.getIndexPlatformId(), computeProjectHash(projectDir));
   }
 
   generateHookConfig(_pluginRoot: string): HookRegistration {

@@ -218,6 +218,14 @@ export interface HookAdapter {
   /** Compute per-project session events file path. */
   getSessionEventsPath(projectDir: string): string;
 
+  // ── ES index naming (Phase 1) ────────────────────────────
+
+  /** Platform identifier for ES index names (e.g., "claude-code"). */
+  getIndexPlatformId(): string;
+
+  /** Compute per-project ES session index name. */
+  getSessionIndexName(projectDir: string): string;
+
   /** Generate hook registration config for this platform. */
   generateHookConfig(pluginRoot: string): HookRegistration;
 
