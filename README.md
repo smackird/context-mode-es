@@ -1,9 +1,10 @@
-# Context Mode
+# Context Mode ES
 
-**The other half of the context problem.**
+**The other half of the context problem — powered by Elasticsearch.**
 
-[![users](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fcdn.jsdelivr.net%2Fgh%2Fmksglu%2Fcontext-mode%40main%2Fstats.json&query=%24.message&label=users&color=brightgreen)](https://www.npmjs.com/package/context-mode) [![npm](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fcdn.jsdelivr.net%2Fgh%2Fmksglu%2Fcontext-mode%40main%2Fstats.json&query=%24.npm&label=npm&color=blue)](https://www.npmjs.com/package/context-mode) [![marketplace](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fcdn.jsdelivr.net%2Fgh%2Fmksglu%2Fcontext-mode%40main%2Fstats.json&query=%24.marketplace&label=marketplace&color=blue)](https://github.com/mksglu/context-mode) [![GitHub stars](https://img.shields.io/github/stars/mksglu/context-mode?style=flat&color=yellow)](https://github.com/mksglu/context-mode/stargazers) [![GitHub forks](https://img.shields.io/github/forks/mksglu/context-mode?style=flat&color=blue)](https://github.com/mksglu/context-mode/network/members) [![Last commit](https://img.shields.io/github/last-commit/mksglu/context-mode?color=green)](https://github.com/mksglu/context-mode/commits) [![License: ELv2](https://img.shields.io/badge/License-ELv2-blue.svg)](LICENSE)
-[![Discord](https://img.shields.io/discord/1478479412700909750?label=Discord&logo=discord&color=5865f2)](https://discord.gg/DCN9jUgN5v)
+> **Fork of [mksglu/context-mode](https://github.com/mksglu/context-mode)** with the persistence layer migrated from SQLite/FTS5 to Elasticsearch 9.3. All session data and indexed content are stored in ES instead of local `.db` files.
+
+[![License: ELv2](https://img.shields.io/badge/License-ELv2-blue.svg)](LICENSE)
 
 ## The Problem
 
@@ -12,46 +13,112 @@ Every MCP tool call dumps raw data into your context window. A Playwright snapsh
 Context Mode is an MCP server that solves both halves of this problem:
 
 1. **Context Saving** — Sandbox tools keep raw data out of the context window. 315 KB becomes 5.4 KB. 98% reduction.
-2. **Session Continuity** — Every file edit, git operation, task, error, and user decision is tracked in SQLite. When the conversation compacts, context-mode doesn't dump this data back into context — it indexes events into FTS5 and retrieves only what's relevant via BM25 search. The model picks up exactly where you left off. If you don't `--continue`, previous session data is deleted immediately — a fresh session means a clean slate.
+2. **Session Continuity** — Every file edit, git operation, task, error, and user decision is tracked in Elasticsearch. When the conversation compacts, context-mode indexes events and retrieves only what's relevant via BM25 search. The model picks up exactly where you left off.
 
-https://github.com/user-attachments/assets/07013dbf-07c0-4ef1-974a-33ea1207637b
+## Prerequisites
+
+- **Elasticsearch 9.3+** running and accessible (local Docker, remote cluster, or Elastic Cloud)
+- **Node.js 18+**
+- An ES API key or username/password for authentication
 
 ## Install
+
+### Step 0 — Configure Elasticsearch connection
+
+Create `secrets/.elastic.env` in the repository root (this file is gitignored):
+
+```env
+# Required — full URL of your Elasticsearch instance
+ELASTIC_HOST=https://your-elasticsearch-host:9200
+
+# Required — API key authentication (preferred)
+ELASTIC_APIKEY=your-base64-encoded-api-key
+
+# Optional — basic auth fallback (only used if ELASTIC_APIKEY is not set)
+# ELASTIC_USERNAME=elastic
+# ELASTIC_PASSWORD=changeme
+
+# Optional — skip TLS cert validation for local Docker with self-signed certs
+# ELASTIC_TLS_REJECT_UNAUTHORIZED=false
+```
+
+You can also set `ELASTIC_ENV_PATH` to point to a different location for this file.
 
 <details open>
 <summary><strong>Claude Code</strong></summary>
 
-**Step 1 — Install the plugin:**
+**Step 1 — Clone and build:**
 
 ```bash
-/plugin marketplace add mksglu/context-mode
-/plugin install context-mode@context-mode
+git clone https://github.com/smackird/context-mode-es.git
+cd context-mode-es
+git checkout es-migration
+npm install
+npm run build
 ```
 
-**Step 2 — Restart Claude Code.**
+**Step 2 — Register as MCP server.** Run from your project directory:
 
-That's it. The plugin installs everything automatically:
-- MCP server with 6 sandbox tools (`ctx_batch_execute`, `ctx_execute`, `ctx_execute_file`, `ctx_index`, `ctx_search`, `ctx_fetch_and_index`)
-- PreToolUse hooks that intercept Bash, Read, WebFetch, Grep, and Task calls — nudging them toward sandbox execution
-- PostToolUse, PreCompact, and SessionStart hooks for session tracking and context injection
-- A `CLAUDE.md` routing instructions file auto-created in your project root
-- Slash commands for diagnostics and upgrades (Claude Code only)
+```bash
+claude mcp add context-mode -- node /path/to/context-mode-es/start.mjs
+```
+
+Replace `/path/to/context-mode-es` with the actual path where you cloned the repo.
+
+**Step 3 — Set up hooks** (for session continuity and routing enforcement):
+
+```bash
+# From your project directory, run the setup command:
+node /path/to/context-mode-es/build/cli.js setup
+```
+
+This auto-configures:
+- PreToolUse hooks that intercept Bash, Read, WebFetch, Grep, and Task calls
+- PostToolUse, PreCompact, and SessionStart hooks for session tracking
+- A `CLAUDE.md` routing instructions file in your project root
+
+**Step 4 — Restart Claude Code.**
+
+**Verify:** Run `ctx doctor` in your Claude Code session. You should see:
+```
+ES connectivity: PASS — your-cluster v9.3.1
+ES search smoke test: PASS — index + search works
+```
 
 | Command | What it does |
 |---|---|
-| `/context-mode:ctx-stats` | Context savings — per-tool breakdown, tokens consumed, savings ratio. |
-| `/context-mode:ctx-doctor` | Diagnostics — runtimes, hooks, FTS5, plugin registration, versions. |
-| `/context-mode:ctx-upgrade` | Pull latest, rebuild, migrate cache, fix hooks. |
+| `ctx stats` | Context savings — per-tool breakdown, tokens consumed, savings ratio. |
+| `ctx doctor` | Diagnostics — runtimes, hooks, ES connectivity, versions. |
+| `ctx upgrade` | Pull latest, rebuild, reconfigure hooks. |
 
-> **Note:** Slash commands are a Claude Code plugin feature. On other platforms, all three utility commands (`ctx stats`, `ctx doctor`, `ctx upgrade`) work as MCP tools — just type the command name and the model will invoke it. See [Utility Commands](#utility-commands).
+</details>
 
-**Alternative — MCP-only install** (no hooks or slash commands):
+<details>
+<summary><strong>Codex CLI</strong></summary>
+
+**Step 1 — Clone and build:**
 
 ```bash
-claude mcp add context-mode -- npx -y context-mode
+git clone https://github.com/smackird/context-mode-es.git
+cd context-mode-es
+git checkout es-migration
+npm install
+npm run build
 ```
 
-This gives you the 6 sandbox tools but without automatic routing. The model can still use them — it just won't be nudged to prefer them over raw Bash/Read/WebFetch. Good for trying it out before committing to the full plugin.
+**Step 2 — Register the MCP server.** Add to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.context-mode]
+command = "node"
+args = ["/path/to/context-mode-es/start.mjs"]
+```
+
+Replace `/path/to/context-mode-es` with the actual clone path.
+
+**Step 3 — Restart Codex CLI.** On first run, an `AGENTS.md` routing instructions file is auto-created in your project root.
+
+> **Note:** Codex CLI does not support hooks. Routing enforcement relies on `AGENTS.md` instructions (~60% compliance). Session continuity (event capture, compaction recovery) is not available on Codex CLI.
 
 </details>
 
@@ -302,11 +369,11 @@ Global `~/.codex/AGENTS.md` applies to all projects. Project-level `./AGENTS.md`
 | `ctx_batch_execute` | Run multiple commands + search multiple queries in ONE call. | 986 KB → 62 KB |
 | `ctx_execute` | Run code in 11 languages. Only stdout enters context. | 56 KB → 299 B |
 | `ctx_execute_file` | Process files in sandbox. Raw content never leaves. | 45 KB → 155 B |
-| `ctx_index` | Chunk markdown into FTS5 with BM25 ranking. | 60 KB → 40 B |
+| `ctx_index` | Chunk markdown into Elasticsearch with BM25 ranking. | 60 KB → 40 B |
 | `ctx_search` | Query indexed content with multiple queries in one call. | On-demand retrieval |
 | `ctx_fetch_and_index` | Fetch URL, detect content type (HTML/JSON/text), chunk and index. | 60 KB → 40 B |
 | `ctx_stats` | Show context savings, call counts, and session statistics. | — |
-| `ctx_doctor` | Diagnose installation: runtimes, hooks, FTS5, versions. | — |
+| `ctx_doctor` | Diagnose installation: runtimes, hooks, ES connectivity, versions. | — |
 | `ctx_upgrade` | Upgrade to latest version from GitHub, rebuild, reconfigure hooks. | — |
 
 ## How the Sandbox Works
@@ -321,7 +388,7 @@ When output exceeds 5 KB and an `intent` is provided, Context Mode switches to i
 
 ## How the Knowledge Base Works
 
-The `ctx_index` tool chunks markdown content by headings while keeping code blocks intact, then stores them in a **SQLite FTS5** (Full-Text Search 5) virtual table. Search uses **BM25 ranking** — a probabilistic relevance algorithm that scores documents based on term frequency, inverse document frequency, and document length normalization. **Porter stemming** is applied at index time so "running", "runs", and "ran" match the same stem.
+The `ctx_index` tool chunks markdown content by headings while keeping code blocks intact, then stores them in **Elasticsearch** with custom analyzers. Search uses **BM25 ranking** — a probabilistic relevance algorithm that scores documents based on term frequency, inverse document frequency, and document length normalization. **English stemming** is applied at index time so "running", "runs", and "ran" match the same stem. **Ngram sub-fields** provide substring matching for partial terms.
 
 When you call `ctx_search`, it returns relevant content snippets focused around matching query terms — not full documents, not approximations, the actual indexed content with smart extraction around what you're looking for. `ctx_fetch_and_index` extends this to URLs: fetch, convert HTML to markdown, chunk, index. The raw page never enters context.
 
@@ -329,9 +396,9 @@ When you call `ctx_search`, it returns relevant content snippets focused around 
 
 Search uses a three-layer fallback to handle typos, partial terms, and substring matches:
 
-- **Layer 1 — Porter stemming**: Standard FTS5 MATCH with porter tokenizer. "caching" matches "cached", "caches", "cach".
-- **Layer 2 — Trigram substring**: FTS5 trigram tokenizer matches partial strings. "useEff" finds "useEffect", "authenticat" finds "authentication".
-- **Layer 3 — Fuzzy correction**: Levenshtein distance corrects typos before re-searching. "kuberntes" → "kubernetes", "autentication" → "authentication".
+- **Layer 1 — Stemmed AND**: English stemmer with AND operator. "caching" matches "cached", "caches", "cach".
+- **Layer 2 — Fuzzy stemmed OR**: Same fields with `fuzziness: "AUTO"`. Corrects typos automatically. "kuberntes" matches "kubernetes".
+- **Layer 3 — Fuzzy ngram OR**: Ngram sub-fields for substring matching. "useEff" finds "useEffect", "authenticat" finds "authentication".
 
 ### Smart Snippets
 
@@ -347,7 +414,7 @@ Search results use intelligent extraction instead of truncation. Instead of retu
 
 When the context window fills up, the agent compacts the conversation — dropping older messages to make room. Without session tracking, the model forgets which files it was editing, what tasks are in progress, what errors were resolved, and what you last asked for.
 
-Context Mode captures every meaningful event during your session and persists them in a per-project SQLite database. When the conversation compacts (or you resume with `--continue`), your working state is rebuilt automatically — the model continues from your last prompt without asking you to repeat anything.
+Context Mode captures every meaningful event during your session and persists them in a per-project Elasticsearch index. When the conversation compacts (or you resume with `--continue`), your working state is rebuilt automatically — the model continues from your last prompt without asking you to repeat anything.
 
 Session continuity requires 4 hooks working together:
 
@@ -390,13 +457,13 @@ Every tool call passes through hooks that extract structured events:
 
 ```
 PreCompact fires
-  → Read all session events from SQLite
+  → Read all session events from Elasticsearch
   → Build priority-tiered XML snapshot (≤2 KB)
-  → Store snapshot in session_resume table
+  → Store snapshot in ES session index
 
 SessionStart fires (source: "compact")
   → Retrieve stored snapshot
-  → Write structured events file → auto-indexed into FTS5
+  → Write structured events file → auto-indexed into ES
   → Build Session Guide with 15 categories
   → Inject <session_knowledge> directive into context
   → Model continues from last user prompt with full working state
@@ -421,7 +488,7 @@ After compaction, the model receives a **Session Guide** — a structured narrat
 - **Session Intent** — mode classification (implement, investigate, review, discuss)
 - **User Role** — behavioral directives set during the session
 
-Detailed event data is also indexed into FTS5 for on-demand retrieval via `search()`.
+Detailed event data is also indexed into Elasticsearch for on-demand retrieval via `search()`.
 
 </details>
 
@@ -484,7 +551,7 @@ See [`docs/platform-support.md`](docs/platform-support.md) for the full capabili
 
 ```
 ctx stats       → context savings, call counts, session report
-ctx doctor      → diagnose runtimes, hooks, FTS5, versions
+ctx doctor      → diagnose runtimes, hooks, ES connectivity, versions
 ctx upgrade     → update from GitHub, rebuild, reconfigure hooks
 ```
 
@@ -594,9 +661,12 @@ Commands chained with `&&`, `;`, or `|` are split — each part is checked separ
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and TDD guidelines.
 
 ```bash
-git clone https://github.com/mksglu/context-mode.git
-cd context-mode && npm install && npm test
+git clone https://github.com/smackird/context-mode-es.git
+cd context-mode-es && git checkout es-migration
+npm install && npm run build && npm test
 ```
+
+> **Note:** Tests require a running Elasticsearch 9.3+ instance and a configured `secrets/.elastic.env` file.
 
 ## License
 
