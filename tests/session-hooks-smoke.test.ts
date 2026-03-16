@@ -1,36 +1,45 @@
 /**
- * Smoke test — Issue #117
+ * Smoke test — Session hooks with ES-backed SessionStore
  *
- * Verifies that session continuity hooks work WITHOUT the build/session/
- * directory. Simulates a fresh marketplace install where tsc has never run.
+ * Verifies that session continuity hooks work with Elasticsearch.
+ * Hooks spawn as subprocesses and connect to the live ES instance.
  *
- * GREEN phase: These tests PASS, proving the bundle-first fix works.
+ * Requires:
+ * - ES 9.3 running and reachable
+ * - secrets/.elastic.env configured (or ELASTIC_ENV_PATH set)
+ * - pnpm build run (hooks import from build/)
  */
 
 import { describe, test, expect, beforeAll, afterAll } from "vitest";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, cpSync, rmSync, existsSync, readdirSync, symlinkSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { mkdtempSync, cpSync, rmSync, existsSync, symlinkSync } from "node:fs";
+import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = join(__dirname, "..");
 
-// Simulate marketplace install: copy plugin WITHOUT build/session/
+// Resolve the secrets env file path for subprocess hooks
+const SECRETS_ENV_PATH = resolve(PROJECT_ROOT, "..", "secrets", ".elastic.env");
+
+// Simulate install: copy plugin with hooks + build
 let fakePluginDir: string;
 let fakeProjectDir: string;
 let fakeHomeDir: string;
-/** Where getSessionDBPath() actually writes: <fakeHome>/.claude/context-mode/sessions/ */
-let sessionDBDir: string;
 
 beforeAll(() => {
-  fakePluginDir = mkdtempSync(join(tmpdir(), "ctx-marketplace-sim-"));
+  fakePluginDir = mkdtempSync(join(tmpdir(), "ctx-es-smoke-"));
 
   // Copy hooks directory
   cpSync(join(PROJECT_ROOT, "hooks"), join(fakePluginDir, "hooks"), { recursive: true });
 
-  // Symlink node_modules (needed for better-sqlite3, too large to copy)
+  // Copy build directory (hooks import from build/es-base.js, build/session/es-db.js)
+  if (existsSync(join(PROJECT_ROOT, "build"))) {
+    cpSync(join(PROJECT_ROOT, "build"), join(fakePluginDir, "build"), { recursive: true });
+  }
+
+  // Symlink node_modules (needed for @elastic/elasticsearch)
   if (existsSync(join(PROJECT_ROOT, "node_modules"))) {
     symlinkSync(join(PROJECT_ROOT, "node_modules"), join(fakePluginDir, "node_modules"));
   }
@@ -38,16 +47,9 @@ beforeAll(() => {
   // Copy package.json (needed for module resolution)
   cpSync(join(PROJECT_ROOT, "package.json"), join(fakePluginDir, "package.json"));
 
-  // DO NOT copy build/session/ — this simulates marketplace install
-  // Verify build/session/ does NOT exist in our fake install
-  expect(existsSync(join(fakePluginDir, "build", "session"))).toBe(false);
-
-  // Fake project dir (value for CLAUDE_PROJECT_DIR)
+  // Fake project dir and HOME
   fakeProjectDir = mkdtempSync(join(tmpdir(), "ctx-project-"));
-
-  // Fake HOME so getSessionDBPath() writes to an isolated location
   fakeHomeDir = mkdtempSync(join(tmpdir(), "ctx-fakehome-"));
-  sessionDBDir = join(fakeHomeDir, ".claude", "context-mode", "sessions");
 });
 
 afterAll(() => {
@@ -61,15 +63,16 @@ function runHook(hookFile: string, input: Record<string, unknown>, env?: Record<
   const result = spawnSync("node", [hookPath], {
     input: JSON.stringify(input),
     encoding: "utf-8",
-    timeout: 10000,
+    timeout: 30000, // ES HTTP calls need more time than SQLite file writes
     env: {
       ...process.env,
       CLAUDE_PROJECT_DIR: fakeProjectDir,
-      CLAUDE_SESSION_ID: "test-session-117",
+      CLAUDE_SESSION_ID: "test-session-es-smoke",
       CONTEXT_MODE_PLATFORM: "claude-code",
-      // Isolate DB writes to fake HOME
       HOME: fakeHomeDir,
       USERPROFILE: fakeHomeDir,
+      // Point hooks to the ES secrets file
+      ELASTIC_ENV_PATH: SECRETS_ENV_PATH,
       ...env,
     },
   });
@@ -80,31 +83,21 @@ function runHook(hookFile: string, input: Record<string, unknown>, env?: Record<
   };
 }
 
-/** Check if any .db files were created in the isolated session directory */
-function getDBFiles(): string[] {
-  return existsSync(sessionDBDir)
-    ? readdirSync(sessionDBDir).filter(f => f.endsWith(".db"))
-    : [];
-}
-
-describe("Issue #117 — Session hooks without build/session/", () => {
-  test("posttooluse.mjs creates session DB via bundle (no build/ needed)", () => {
+describe("Session hooks with ES-backed SessionStore", () => {
+  test("posttooluse.mjs captures events via ES", () => {
     const result = runHook("posttooluse.mjs", {
-      session_id: "test-session-117",
+      session_id: "test-session-es-smoke",
       tool_name: "Read",
       tool_input: { file_path: "/src/main.ts" },
       tool_response: "const x = 1;",
     });
 
     expect(result.exitCode).toBe(0);
-
-    // Bundle-first fix: DB is created in ~/.claude/context-mode/sessions/
-    expect(getDBFiles().length).toBeGreaterThan(0);
   });
 
-  test("sessionstart.mjs routing block works (independent of build/)", () => {
+  test("sessionstart.mjs routing block works on startup", () => {
     const result = runHook("sessionstart.mjs", {
-      session_id: "test-session-117",
+      session_id: "test-session-es-smoke",
       source: "startup",
     });
 
@@ -115,18 +108,23 @@ describe("Issue #117 — Session hooks without build/session/", () => {
     expect(parsed.hookSpecificOutput?.additionalContext).toBeDefined();
   });
 
-  test("sessionstart.mjs compact recovery works via bundle", () => {
-    // First capture some events with same session_id
+  test("sessionstart.mjs compact recovery works via ES", () => {
+    // First capture some events
     runHook("posttooluse.mjs", {
-      session_id: "test-session-117",
+      session_id: "test-session-es-smoke",
       tool_name: "Bash",
       tool_input: { command: "npm test" },
       tool_response: "all tests passed",
     });
 
-    // Trigger compact — session recovery now works via bundled session-db
+    // Build a resume snapshot
+    runHook("precompact.mjs", {
+      session_id: "test-session-es-smoke",
+    });
+
+    // Trigger compact — session recovery should inject session_knowledge
     const result = runHook("sessionstart.mjs", {
-      session_id: "test-session-117",
+      session_id: "test-session-es-smoke",
       source: "compact",
     });
 
@@ -134,25 +132,22 @@ describe("Issue #117 — Session hooks without build/session/", () => {
     const parsed = JSON.parse(result.stdout);
     const ctx = parsed.hookSpecificOutput?.additionalContext ?? "";
 
-    // Fix verified: compact recovery injects session_knowledge
+    // Compact recovery injects session_knowledge
     expect(ctx).toContain("session_knowledge");
   });
 
-  test("userpromptsubmit.mjs captures prompts via bundle", () => {
+  test("userpromptsubmit.mjs captures prompts via ES", () => {
     const result = runHook("userpromptsubmit.mjs", {
       prompt: "fix the login bug",
-      session_id: "test-session-117",
+      session_id: "test-session-es-smoke",
     });
 
     expect(result.exitCode).toBe(0);
-
-    // DB should be created via bundle
-    expect(getDBFiles().length).toBeGreaterThan(0);
   });
 
-  test("precompact.mjs creates snapshot via bundle", () => {
+  test("precompact.mjs creates snapshot via ES", () => {
     const result = runHook("precompact.mjs", {
-      session_id: "test-session-117",
+      session_id: "test-session-es-smoke",
     });
 
     expect(result.exitCode).toBe(0);

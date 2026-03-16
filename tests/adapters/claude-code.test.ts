@@ -204,6 +204,20 @@ describe("ClaudeCodeAdapter", () => {
         join(homedir(), ".claude", "context-mode", "sessions", `${hash}.db`),
       );
     });
+
+    it("ES session index name uses platform and sha256 hash", () => {
+      const projectDir = "/my/project";
+      const hash = createHash("sha256")
+        .update(projectDir)
+        .digest("hex")
+        .slice(0, 16);
+      const indexName = adapter.getSessionIndexName(projectDir);
+      expect(indexName).toBe(`ctx-sessions-claude-code-${hash}`);
+    });
+
+    it("index platform ID is claude-code", () => {
+      expect(adapter.getIndexPlatformId()).toBe("claude-code");
+    });
   });
 
   // ── validateHooks (Issue #94) ─────────────────────────
