@@ -998,7 +998,7 @@ server.registerTool(
 );
 
 // ─────────────────────────────────────────────────────────
-// Turndown path resolution (external dep, like better-sqlite3)
+// Turndown path resolution (external dep)
 // ─────────────────────────────────────────────────────────
 
 let _turndownPath: string | null = null;

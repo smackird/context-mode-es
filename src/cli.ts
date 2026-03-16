@@ -4,7 +4,7 @@
  *
  * Usage:
  *   context-mode                              → Start MCP server (stdio)
- *   context-mode doctor                       → Diagnose runtime issues, hooks, FTS5, version
+ *   context-mode doctor                       → Diagnose runtime issues, hooks, ES connectivity, version
  *   context-mode upgrade                      → Fix hooks, permissions, and settings
  *   context-mode hook <platform> <event>      → Dispatch a hook script (used by platform hook configs)
  *
@@ -15,10 +15,10 @@
 import * as p from "@clack/prompts";
 import color from "picocolors";
 import { execSync } from "node:child_process";
-import { readFileSync, cpSync, accessSync, existsSync, readdirSync, rmSync, closeSync, openSync, constants } from "node:fs";
+import { readFileSync, cpSync, accessSync, existsSync, readdirSync, rmSync, constants } from "node:fs";
 import { request as httpsRequest } from "node:https";
 import { resolve, dirname, join } from "node:path";
-import { tmpdir, devNull } from "node:os";
+import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   detectRuntimes,
@@ -63,17 +63,6 @@ const HOOK_MAP: Record<string, Record<string, string>> = {
 };
 
 async function hookDispatch(platform: string, event: string): Promise<void> {
-  // Suppress stderr at OS fd level — native C++ modules (better-sqlite3) write
-  // directly to fd 2 during initialization, bypassing Node.js process.stderr.
-  // Platforms like Claude Code interpret ANY stderr output as hook failure.
-  // Cross-platform: os.devNull → /dev/null (Unix) or \\.\NUL (Windows). See: #68
-  try {
-    closeSync(2);
-    openSync(devNull, "w"); // Acquires fd 2 (lowest available)
-  } catch {
-    process.stderr.write = (() => true) as typeof process.stderr.write;
-  }
-
   const scriptPath = HOOK_MAP[platform]?.[event];
   if (!scriptPath) {
     process.exit(1);

@@ -110,7 +110,7 @@ if (cacheMatch) {
 }
 
 // Ensure external dependencies are available
-for (const pkg of ["better-sqlite3", "turndown", "turndown-plugin-gfm", "@mixmark-io/domino"]) {
+for (const pkg of ["@elastic/elasticsearch", "turndown", "turndown-plugin-gfm", "@mixmark-io/domino"]) {
   if (!existsSync(resolve(__dirname, "node_modules", pkg))) {
     try {
       execSync(`npm install ${pkg} --no-package-lock --no-save --silent`, {
