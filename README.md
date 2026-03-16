@@ -122,6 +122,13 @@ Replace `/path/to/context-mode-es` with the actual clone path.
 
 </details>
 
+<!--
+NOTE: The following platform install sections are from the upstream mksglu/context-mode
+README and reference `npm install -g context-mode` (the SQLite-backed npm package).
+They are commented out because this ES fork requires a git-based install with
+Elasticsearch configuration. These sections will be updated when ES-backed install
+instructions are written for each platform.
+
 <details>
 <summary><strong>Gemini CLI</strong> <sup>(Beta)</sup></summary>
 
@@ -361,6 +368,8 @@ cp ~/.codex/AGENTS.md  # auto-created, or copy from node_modules/context-mode/co
 Global `~/.codex/AGENTS.md` applies to all projects. Project-level `./AGENTS.md` applies to the current project only. If both exist, Codex CLI merges them.
 
 </details>
+END of commented-out upstream platform sections.
+-->
 
 ## Tools
 
