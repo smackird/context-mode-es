@@ -133,6 +133,51 @@ export function getSessionIndexName(opts = CLAUDE_OPTS) {
 }
 
 /**
+ * ES replacement for orphan event cleanup.
+ * Deletes event documents whose session_id has no corresponding meta document.
+ * Replaces: db.db.exec(`DELETE FROM session_events WHERE session_id NOT IN (SELECT session_id FROM session_meta)`)
+ * Used by sessionstart variants when callers switch in Phase 5.
+ */
+export async function deleteOrphanEventsES(client, indexName) {
+  try {
+    // Step 1: Get all session_ids that have meta docs
+    const metaResult = await client.search({
+      index: indexName,
+      query: { term: { doc_type: "meta" } },
+      _source: ["session_id"],
+      size: 10000,
+    });
+    const validSessionIds = new Set(
+      metaResult.hits.hits.map(hit => hit._source?.session_id).filter(Boolean)
+    );
+
+    if (validSessionIds.size === 0) {
+      // No meta docs at all — delete all events (all are orphans)
+      await client.deleteByQuery({
+        index: indexName,
+        query: { term: { doc_type: "event" } },
+        refresh: true,
+      });
+      return;
+    }
+
+    // Step 2: Delete events whose session_id is NOT in the valid set
+    await client.deleteByQuery({
+      index: indexName,
+      query: {
+        bool: {
+          filter: [{ term: { doc_type: "event" } }],
+          must_not: [{ terms: { session_id: Array.from(validSessionIds) } }],
+        },
+      },
+      refresh: true,
+    });
+  } catch {
+    // Fail-open: orphan cleanup is best-effort
+  }
+}
+
+/**
  * Return the per-project cleanup flag path.
  * Used to detect true fresh starts vs --continue (which fires startup+resume).
  * Path: ~/<configDir>/context-mode/sessions/<SHA256(projectDir)[:16]>.cleanup

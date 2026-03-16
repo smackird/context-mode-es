@@ -293,31 +293,73 @@ async function doctor(): Promise<number> {
     );
   }
 
-  // FTS5 / better-sqlite3
-  p.log.step("Checking FTS5 / better-sqlite3...");
+  // Elasticsearch connectivity + search smoke test
+  p.log.step("Checking Elasticsearch connectivity...");
   try {
-    const Database = (await import("better-sqlite3")).default;
-    const db = new Database(":memory:");
-    db.exec("CREATE VIRTUAL TABLE fts_test USING fts5(content)");
-    db.exec("INSERT INTO fts_test(content) VALUES ('hello world')");
-    const row = db.prepare("SELECT * FROM fts_test WHERE fts_test MATCH 'hello'").get() as { content: string } | undefined;
-    db.close();
-    if (row && row.content === "hello world") {
-      p.log.success(color.green("FTS5 / better-sqlite3: PASS") + " — native module works");
-    } else {
-      criticalFails++;
-      p.log.error(color.red("FTS5 / better-sqlite3: FAIL") + " — query returned unexpected result");
+    const { loadElasticConfig, getClient } = await import("./es-base.js");
+    loadElasticConfig();
+    const client = getClient();
+
+    // Version check (per decision D-09)
+    const info = await client.info();
+    const esVersion = info.version?.number ?? "unknown";
+    p.log.success(
+      color.green("ES connectivity: PASS") +
+        color.dim(` — ${info.cluster_name} v${esVersion}`),
+    );
+
+    // Search smoke test: create transient index, index, search, verify, cleanup
+    const testIndex = `context-mode-doctor-test-${Date.now()}`;
+    try {
+      await client.indices.create({
+        index: testIndex,
+        settings: { number_of_shards: 1, number_of_replicas: 0 },
+        mappings: { properties: { content: { type: "text" } } },
+      });
+      await client.index({
+        index: testIndex,
+        id: "test-1",
+        document: { content: "hello world" },
+        refresh: true,
+      });
+      const searchResult = await client.search({
+        index: testIndex,
+        query: { match: { content: "hello" } },
+      });
+      const hit = searchResult.hits.hits[0]?._source as { content: string } | undefined;
+      if (hit && hit.content === "hello world") {
+        p.log.success(color.green("ES search smoke test: PASS") + " — index + search works");
+      } else {
+        criticalFails++;
+        p.log.error(color.red("ES search smoke test: FAIL") + " — query returned unexpected result");
+      }
+    } finally {
+      try {
+        await client.indices.delete({ index: testIndex, ignore_unavailable: true });
+      } catch { /* best-effort cleanup */ }
     }
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
-    if (message.includes("Cannot find module") || message.includes("MODULE_NOT_FOUND")) {
-      p.log.warn(color.yellow("FTS5 / better-sqlite3: SKIP") + color.dim(" — module not available (restart session after upgrade)"));
+    if (message.includes("ECONNREFUSED")) {
+      criticalFails++;
+      p.log.error(
+        color.red("Elasticsearch: FAIL") +
+          ` — connection refused` +
+          color.dim("\n  Ensure Elasticsearch is running: docker compose up -d"),
+      );
+    } else if (message.includes("ELASTIC_HOST")) {
+      criticalFails++;
+      p.log.error(
+        color.red("Elasticsearch: FAIL") +
+          ` — ${message}` +
+          color.dim("\n  Create secrets/.elastic.env with ELASTIC_HOST and ELASTIC_APIKEY"),
+      );
+    } else if (message.includes("Cannot find module") || message.includes("MODULE_NOT_FOUND")) {
+      p.log.warn(color.yellow("Elasticsearch: SKIP") + color.dim(" — @elastic/elasticsearch not installed"));
     } else {
       criticalFails++;
       p.log.error(
-        color.red("FTS5 / better-sqlite3: FAIL") +
-          ` — ${message}` +
-          color.dim("\n  Try: npm rebuild better-sqlite3"),
+        color.red("Elasticsearch: FAIL") + ` — ${message}`,
       );
     }
   }

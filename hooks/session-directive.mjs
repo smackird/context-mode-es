@@ -416,7 +416,7 @@ export function buildSessionDirective(source, eventMeta) {
 
   // Search on demand — detailed data lives in FTS5
   block += `\n<session_search>`;
-  block += `\nDetailed session data is indexed in context-mode FTS5 (source: "session-events").`;
+  block += `\nDetailed session data is indexed in context-mode Elasticsearch (source: "session-events").`;
   block += `\nUse mcp__plugin_context-mode_context-mode__ctx_search(queries: [...], source: "session-events") when you need specifics.`;
   block += `\nDo NOT call ctx_index() — data is already indexed.`;
   block += `\n</session_search>`;
@@ -448,4 +448,79 @@ export function getLatestSessionEvents(db) {
   ).get();
   if (!latest) return [];
   return getSessionEvents(db, latest.session_id);
+}
+
+// ═══════════════════════════════════════════════════════════
+// ES replacements (Phase 4) — used when callers switch in Phase 5
+// ═══════════════════════════════════════════════════════════
+
+/**
+ * ES replacement for getSessionEvents.
+ * Returns events for a session sorted by created_at ASC.
+ * Receives an ES Client + index name instead of SessionDB.
+ */
+export async function getSessionEventsES(client, indexName, sessionId) {
+  try {
+    const result = await client.search({
+      index: indexName,
+      query: {
+        bool: {
+          filter: [
+            { term: { doc_type: "event" } },
+            { term: { session_id: sessionId } },
+          ],
+        },
+      },
+      sort: [{ created_at: "asc" }],
+      _source: ["session_id", "type", "category", "priority", "data", "source_hook", "created_at"],
+      size: 10000,
+    });
+    return result.hits.hits.map(hit => hit._source);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * ES replacement for getLatestSessionEvents.
+ * Finds the most recent session that has events, then returns its events.
+ * Two-step: query meta docs for candidates, then check which has events.
+ */
+export async function getLatestSessionEventsES(client, indexName) {
+  try {
+    // Step 1: Find recent sessions by started_at DESC
+    const metaResult = await client.search({
+      index: indexName,
+      query: { term: { doc_type: "meta" } },
+      sort: [{ started_at: "desc" }],
+      _source: ["session_id"],
+      size: 5,
+    });
+
+    // Step 2: For each candidate, check if it has events
+    for (const hit of metaResult.hits.hits) {
+      const sessionId = hit._source?.session_id;
+      if (!sessionId) continue;
+
+      const countResult = await client.count({
+        index: indexName,
+        query: {
+          bool: {
+            filter: [
+              { term: { doc_type: "event" } },
+              { term: { session_id: sessionId } },
+            ],
+          },
+        },
+      });
+
+      if (countResult.count > 0) {
+        return getSessionEventsES(client, indexName, sessionId);
+      }
+    }
+
+    return [];
+  } catch {
+    return [];
+  }
 }
