@@ -14,13 +14,13 @@
  *   - Session cleanup happens at plugin init (no SessionStart)
  */
 
-import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { randomUUID } from "node:crypto";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { SessionDB } from "./session/db.js";
+import { SessionStore } from "./session/es-db.js";
+import { loadElasticConfig, getClient } from "./es-base.js";
+import { computeProjectHash } from "./adapters/es-index-naming.js";
 import { extractEvents } from "./session/extract.js";
 import type { HookInput } from "./session/extract.js";
 import { buildResumeSnapshot } from "./session/snapshot.js";
@@ -43,28 +43,6 @@ interface ToolHookInput {
   sessionID?: string;
 }
 
-// ── Helpers ───────────────────────────────────────────────
-
-function getSessionDir(): string {
-  const dir = join(
-    homedir(),
-    ".config",
-    "opencode",
-    "context-mode",
-    "sessions",
-  );
-  mkdirSync(dir, { recursive: true });
-  return dir;
-}
-
-function getDBPath(projectDir: string): string {
-  const hash = createHash("sha256")
-    .update(projectDir)
-    .digest("hex")
-    .slice(0, 16);
-  return join(getSessionDir(), `${hash}.db`);
-}
-
 // ── Plugin Factory ────────────────────────────────────────
 
 /**
@@ -80,11 +58,15 @@ export const ContextModePlugin = async (ctx: PluginContext) => {
   const routing = await import(pathToFileURL(routingPath).href);
   await routing.initSecurity(buildDir);
 
-  // Initialize session
+  // Initialize ES-backed session store
   const projectDir = ctx.directory;
-  const db = new SessionDB({ dbPath: getDBPath(projectDir) });
+  loadElasticConfig();
+  const client = getClient();
+  const hash = computeProjectHash(projectDir);
+  const indexName = `ctx-sessions-opencode-${hash}`;
+  const store = await SessionStore.create(client, indexName);
   const sessionId = randomUUID();
-  db.ensureSession(sessionId, projectDir);
+  await store.ensureSession(sessionId, projectDir);
 
   // Auto-write AGENTS.md on startup for OpenCode projects
   try {
@@ -94,7 +76,7 @@ export const ContextModePlugin = async (ctx: PluginContext) => {
   }
 
   // Clean up old sessions on startup (replaces SessionStart hook)
-  db.cleanupOldSessions(0);
+  await store.cleanupOldSessions(0);
 
   return {
     // ── PreToolUse: Routing enforcement ─────────────────
@@ -138,8 +120,7 @@ export const ContextModePlugin = async (ctx: PluginContext) => {
 
         const events = extractEvents(hookInput);
         for (const event of events) {
-          // Cast: extract.ts SessionEvent lacks data_hash (computed by insertEvent)
-          db.insertEvent(sessionId, event as SessionEvent, "PostToolUse");
+          await store.insertEvent(sessionId, event as SessionEvent, "PostToolUse");
         }
       } catch {
         // Silent — session capture must never break the tool call
@@ -150,16 +131,16 @@ export const ContextModePlugin = async (ctx: PluginContext) => {
 
     "experimental.session.compacting": async () => {
       try {
-        const events = db.getEvents(sessionId);
+        const events = await store.getEvents(sessionId);
         if (events.length === 0) return "";
 
-        const stats = db.getSessionStats(sessionId);
+        const stats = await store.getSessionStats(sessionId);
         const snapshot = buildResumeSnapshot(events, {
           compactCount: (stats?.compact_count ?? 0) + 1,
         });
 
-        db.upsertResume(sessionId, snapshot, events.length);
-        db.incrementCompactCount(sessionId);
+        await store.upsertResume(sessionId, snapshot, events.length);
+        await store.incrementCompactCount(sessionId);
 
         return snapshot;
       } catch {

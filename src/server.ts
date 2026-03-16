@@ -9,7 +9,10 @@ import { fileURLToPath } from "node:url";
 import { homedir, tmpdir } from "node:os";
 import { z } from "zod";
 import { PolyglotExecutor } from "./executor.js";
-import { ContentStore, cleanupStaleDBs, type SearchResult, type IndexResult } from "./store.js";
+import { ContentStoreES, cleanupStaleIndices, type SearchResult, type IndexResult } from "./store-es.js";
+import { loadElasticConfig, getClient } from "./es-base.js";
+import { SessionStore } from "./session/es-db.js";
+import { computeProjectHash, buildContentIndexName } from "./adapters/es-index-naming.js";
 import {
   readBashPolicies,
   evaluateCommandDenyOnly,
@@ -47,18 +50,16 @@ const executor = new PolyglotExecutor({
   projectRoot: process.env.CLAUDE_PROJECT_DIR,
 });
 
-// Lazy singleton — no DB overhead unless index/search is used
-let _store: ContentStore | null = null;
+// Lazy singleton — no ES overhead unless index/search is used
+let _store: ContentStoreES | null = null;
+let _storePromise: Promise<ContentStoreES> | null = null;
 
 /**
  * Auto-index session events files written by SessionStart hook.
  * Scans ~/.claude/context-mode/sessions/ for *-events.md files.
- * CLAUDE_PROJECT_DIR is NOT available to MCP servers — only to hooks —
- * so we glob-scan instead of computing a specific hash.
  * Files are consumed (deleted) after indexing to prevent double-indexing.
- * Called on every getStore() — readdirSync is sub-millisecond when no files match.
  */
-function maybeIndexSessionEvents(store: ContentStore): void {
+async function maybeIndexSessionEvents(store: ContentStoreES): Promise<void> {
   try {
     const sessionsDir = join(homedir(), ".claude", "context-mode", "sessions");
     if (!existsSync(sessionsDir)) return;
@@ -66,17 +67,33 @@ function maybeIndexSessionEvents(store: ContentStore): void {
     for (const file of files) {
       const filePath = join(sessionsDir, file);
       try {
-        store.index({ path: filePath, source: "session-events" });
+        await store.index({ path: filePath, source: "session-events" });
         unlinkSync(filePath);
       } catch { /* best-effort per file */ }
     }
   } catch { /* best-effort — session continuity never blocks tools */ }
 }
 
-function getStore(): ContentStore {
-  if (!_store) _store = new ContentStore();
-  maybeIndexSessionEvents(_store);
-  return _store;
+async function getStore(): Promise<ContentStoreES> {
+  if (_store) {
+    await maybeIndexSessionEvents(_store);
+    return _store;
+  }
+  // Lock to prevent concurrent initialization (per G-08)
+  if (!_storePromise) {
+    _storePromise = (async () => {
+      loadElasticConfig();
+      const client = getClient();
+      const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
+      const hash = computeProjectHash(projectDir);
+      const indexName = buildContentIndexName(hash);
+      const store = await ContentStoreES.create(client, indexName);
+      _store = store;
+      await maybeIndexSessionEvents(store);
+      return store;
+    })();
+  }
+  return _storePromise;
 }
 
 // ─────────────────────────────────────────────────────────
@@ -493,7 +510,7 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
           trackIndexed(Buffer.byteLength(output));
           return trackResponse("ctx_execute", {
             content: [
-              { type: "text" as const, text: intentSearch(output, intent, isError ? `execute:${language}:error` : `execute:${language}`) },
+              { type: "text" as const, text: await intentSearch(output, intent, isError ? `execute:${language}:error` : `execute:${language}`) },
             ],
             isError,
           });
@@ -513,7 +530,7 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
         trackIndexed(Buffer.byteLength(stdout));
         return trackResponse("ctx_execute", {
           content: [
-            { type: "text" as const, text: intentSearch(stdout, intent, `execute:${language}`) },
+            { type: "text" as const, text: await intentSearch(stdout, intent, `execute:${language}`) },
           ],
         });
       }
@@ -539,13 +556,13 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
 // Helper: index stdout into FTS5 knowledge base
 // ─────────────────────────────────────────────────────────
 
-function indexStdout(
+async function indexStdout(
   stdout: string,
   source: string,
-): { content: Array<{ type: "text"; text: string }> } {
-  const store = getStore();
+): Promise<{ content: Array<{ type: "text"; text: string }> }> {
+  const store = await getStore();
   trackIndexed(Buffer.byteLength(stdout));
-  const indexed = store.index({ content: stdout, source });
+  const indexed = await store.index({ content: stdout, source });
   return {
     content: [
       {
@@ -562,24 +579,24 @@ function indexStdout(
 
 const INTENT_SEARCH_THRESHOLD = 5_000; // bytes — ~80-100 lines
 
-function intentSearch(
+async function intentSearch(
   stdout: string,
   intent: string,
   source: string,
   maxResults: number = 5,
-): string {
+): Promise<string> {
   const totalLines = stdout.split("\n").length;
   const totalBytes = Buffer.byteLength(stdout);
 
   // Index into the PERSISTENT store so user can search() later
-  const persistent = getStore();
-  const indexed = persistent.indexPlainText(stdout, source);
+  const persistent = await getStore();
+  const indexed = await persistent.indexPlainText(stdout, source);
 
   // Search the persistent store directly (porter → trigram → fuzzy)
-  let results = persistent.searchWithFallback(intent, maxResults, source);
+  let results = await persistent.searchWithFallback(intent, maxResults, source);
 
   // Extract distinctive terms as vocabulary hints for the LLM
-  const distinctiveTerms = persistent.getDistinctiveTerms(indexed.sourceId);
+  const distinctiveTerms = await persistent.getDistinctiveTerms(indexed.label);
 
   if (results.length === 0) {
     const lines = [
@@ -708,7 +725,7 @@ server.registerTool(
           trackIndexed(Buffer.byteLength(output));
           return trackResponse("ctx_execute_file", {
             content: [
-              { type: "text" as const, text: intentSearch(output, intent, isError ? `file:${path}:error` : `file:${path}`) },
+              { type: "text" as const, text: await intentSearch(output, intent, isError ? `file:${path}:error` : `file:${path}`) },
             ],
             isError,
           });
@@ -727,7 +744,7 @@ server.registerTool(
         trackIndexed(Buffer.byteLength(stdout));
         return trackResponse("ctx_execute_file", {
           content: [
-            { type: "text" as const, text: intentSearch(stdout, intent, `file:${path}`) },
+            { type: "text" as const, text: await intentSearch(stdout, intent, `file:${path}`) },
           ],
         });
       }
@@ -813,8 +830,8 @@ server.registerTool(
           trackIndexed(fs.readFileSync(path).byteLength);
         } catch { /* ignore — file read errors handled by store */ }
       }
-      const store = getStore();
-      const result = store.index({ content, path, source });
+      const store = await getStore();
+      const result = await store.index({ content, path, source });
 
       return trackResponse("ctx_index", {
         content: [
@@ -872,7 +889,7 @@ server.registerTool(
   },
   async (params) => {
     try {
-      const store = getStore();
+      const store = await getStore();
       const raw = params as Record<string, unknown>;
 
       // Normalize: accept both query (string) and queries (array)
@@ -928,7 +945,7 @@ server.registerTool(
           continue;
         }
 
-        const results = store.searchWithFallback(q, effectiveLimit, source);
+        const results = await store.searchWithFallback(q, effectiveLimit, source);
 
         if (results.length === 0) {
           sections.push(`## ${q}\nNo results found.`);
@@ -958,7 +975,7 @@ server.registerTool(
       }
 
       if (output.trim().length === 0) {
-        const sources = store.listSources();
+        const sources = await store.listSources();
         const sourceList = sources.length > 0
           ? `\nIndexed sources: ${sources.map((s) => `"${s.label}" (${s.chunkCount} sections)`).join(", ")}`
           : "";
@@ -992,7 +1009,7 @@ function resolveTurndownPath(): string {
     const require = createRequire(import.meta.url);
     _turndownPath = require.resolve("turndown");
   }
-  return _turndownPath;
+  return _turndownPath!;
 }
 
 function resolveGfmPluginPath(): string {
@@ -1000,7 +1017,7 @@ function resolveGfmPluginPath(): string {
     const require = createRequire(import.meta.url);
     _gfmPluginPath = require.resolve("turndown-plugin-gfm");
   }
-  return _gfmPluginPath;
+  return _gfmPluginPath!;
 }
 
 // ─────────────────────────────────────────────────────────
@@ -1108,7 +1125,7 @@ server.registerTool(
       }
 
       // Parse content-type marker from stdout (content is in the temp file)
-      const store = getStore();
+      const store = await getStore();
       const header = (result.stdout || "").trim();
 
       // Read full content from temp file (bypasses smartTruncate)
@@ -1144,12 +1161,12 @@ server.registerTool(
       // Route to the appropriate indexing strategy based on Content-Type
       let indexed: IndexResult;
       if (header === "__CM_CT__:json") {
-        indexed = store.indexJSON(markdown, source ?? url);
+        indexed = await store.indexJSON(markdown, source ?? url);
       } else if (header === "__CM_CT__:text") {
-        indexed = store.indexPlainText(markdown, source ?? url);
+        indexed = await store.indexPlainText(markdown, source ?? url);
       } else {
         // HTML (default) — content is already converted to markdown
-        indexed = store.index({ content: markdown, source: source ?? url });
+        indexed = await store.index({ content: markdown, source: source ?? url });
       }
 
       // Build preview — first ~3KB of markdown for immediate use
@@ -1302,15 +1319,15 @@ server.registerTool(
       trackIndexed(totalBytes);
 
       // Index into knowledge base — markdown heading chunking splits by # labels
-      const store = getStore();
+      const store = await getStore();
       const source = `batch:${commands
         .map((c) => c.label)
         .join(",")
         .slice(0, 80)}`;
-      const indexed = store.index({ content: stdout, source });
+      const indexed = await store.index({ content: stdout, source });
 
       // Build section inventory — direct query by source_id (no FTS5 MATCH needed)
-      const allSections = store.getChunksBySource(indexed.sourceId);
+      const allSections = await store.getChunksBySource(indexed.label);
       const inventory: string[] = ["## Indexed Sections", ""];
       const sectionTitles: string[] = [];
       for (const s of allSections) {
@@ -1332,12 +1349,12 @@ server.registerTool(
         }
 
         // Tier 1: scoped search with fallback (porter → trigram → fuzzy)
-        let results = store.searchWithFallback(query, 3, source);
+        let results = await store.searchWithFallback(query, 3, source);
         let crossSource = false;
 
         // Tier 2: global fallback (no source filter) — warn about cross-source (Issue #61)
         if (results.length === 0) {
-          results = store.searchWithFallback(query, 3);
+          results = await store.searchWithFallback(query, 3);
           crossSource = results.length > 0;
         }
 
@@ -1366,7 +1383,7 @@ server.registerTool(
 
       // Get searchable terms for edge cases where follow-up is needed
       const distinctiveTerms = store.getDistinctiveTerms
-        ? store.getDistinctiveTerms(indexed.sourceId)
+        ? await store.getDistinctiveTerms(indexed.label)
         : [];
 
       const output = [
@@ -1489,119 +1506,151 @@ server.registerTool(
       }
     }
 
-    // ── Session Continuity ──
+    // ── Session Continuity (ES-backed) ──
     try {
       const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
-      const dbHash = createHash("sha256").update(projectDir).digest("hex").slice(0, 16);
-      const sessionDbPath = join(homedir(), ".claude", "context-mode", "sessions", `${dbHash}.db`);
+      const projHash = computeProjectHash(projectDir);
+      // Use claude-code platform for session index name (server.ts runs in Claude Code context)
+      const sessionIndexName = `ctx-sessions-claude-${projHash}`;
 
-      if (existsSync(sessionDbPath)) {
-        const require = createRequire(import.meta.url);
-        const Database = require("better-sqlite3");
-        const sdb = new Database(sessionDbPath, { readonly: true });
+      loadElasticConfig();
+      const esClient = getClient();
+      const sessionStore = await SessionStore.create(esClient, sessionIndexName);
 
-        const eventTotal = sdb.prepare("SELECT COUNT(*) as cnt FROM session_events").get() as { cnt: number };
-        const byCategory = sdb.prepare(
-          "SELECT category, COUNT(*) as cnt FROM session_events GROUP BY category ORDER BY cnt DESC",
-        ).all() as Array<{ category: string; cnt: number }>;
-        const meta = sdb.prepare(
-          "SELECT compact_count FROM session_meta ORDER BY started_at DESC LIMIT 1",
-        ).get() as { compact_count: number } | undefined;
-        const resume = sdb.prepare(
-          "SELECT event_count, consumed FROM session_resume ORDER BY created_at DESC LIMIT 1",
-        ).get() as { event_count: number; consumed: number } | undefined;
+      // Count all events across all sessions
+      const countResult = await esClient.count({
+        index: sessionIndexName,
+        query: { term: { doc_type: "event" } },
+      });
+      const eventTotal = countResult.count;
 
-        if (eventTotal.cnt > 0) {
-          const compacts = meta?.compact_count ?? 0;
+      if (eventTotal > 0) {
+        // Get events by category via ES aggregation
+        const catResult = await esClient.search({
+          index: sessionIndexName,
+          size: 0,
+          query: { term: { doc_type: "event" } },
+          aggs: {
+            by_category: { terms: { field: "category", size: 50 } },
+          },
+        });
+        const byCategory = ((catResult.aggregations?.by_category as { buckets: Array<{ key: string; doc_count: number }> })?.buckets ?? [])
+          .map(b => ({ category: b.key, cnt: b.doc_count }))
+          .sort((a, b) => b.cnt - a.cnt);
 
-          // Query actual data per category for preview
-          const previewRows = sdb.prepare(
-            `SELECT category, type, data FROM session_events ORDER BY id DESC`,
-          ).all() as Array<{ category: string; type: string; data: string }>;
+        // Get latest meta for compact count
+        const metaResult = await esClient.search({
+          index: sessionIndexName,
+          size: 1,
+          query: { term: { doc_type: "meta" } },
+          sort: [{ started_at: "desc" }],
+          _source: ["compact_count"],
+        });
+        const metaHit = metaResult.hits.hits[0]?._source as { compact_count: number } | undefined;
 
-          // Build previews: unique values per category
-          const previews = new Map<string, Set<string>>();
-          for (const row of previewRows) {
-            if (!previews.has(row.category)) previews.set(row.category, new Set());
-            const set = previews.get(row.category)!;
-            if (set.size < 5) {
-              let display = row.data;
-              if (row.category === "file") {
-                display = row.data.split("/").pop() || row.data;
-              } else if (row.category === "prompt") {
-                display = display.length > 50 ? display.slice(0, 47) + "..." : display;
-              }
-              if (display.length > 40) display = display.slice(0, 37) + "...";
-              set.add(display);
+        // Get latest resume
+        const resumeResult = await esClient.search({
+          index: sessionIndexName,
+          size: 1,
+          query: { term: { doc_type: "resume" } },
+          sort: [{ created_at: "desc" }],
+          _source: ["event_count", "consumed"],
+        });
+        const resumeHit = resumeResult.hits.hits[0]?._source as { event_count: number; consumed: number } | undefined;
+
+        const compacts = metaHit?.compact_count ?? 0;
+
+        // Get preview data (recent events)
+        const previewResult = await esClient.search({
+          index: sessionIndexName,
+          size: 200,
+          query: { term: { doc_type: "event" } },
+          sort: [{ seq: "desc" }],
+          _source: ["category", "type", "data"],
+        });
+        const previewRows = previewResult.hits.hits.map(h => h._source as { category: string; type: string; data: string });
+
+        const previews = new Map<string, Set<string>>();
+        for (const row of previewRows) {
+          if (!previews.has(row.category)) previews.set(row.category, new Set());
+          const set = previews.get(row.category)!;
+          if (set.size < 5) {
+            let display = row.data;
+            if (row.category === "file") {
+              display = row.data.split("/").pop() || row.data;
+            } else if (row.category === "prompt") {
+              display = display.length > 50 ? display.slice(0, 47) + "..." : display;
             }
+            if (display.length > 40) display = display.slice(0, 37) + "...";
+            set.add(display);
           }
-
-          const categoryLabels: Record<string, string> = {
-            file: "Files tracked",
-            rule: "Project rules (CLAUDE.md)",
-            prompt: "Your requests saved",
-            mcp: "Plugin tools used",
-            git: "Git operations",
-            env: "Environment setup",
-            error: "Errors caught",
-            task: "Tasks in progress",
-            decision: "Your decisions",
-            cwd: "Working directory",
-            skill: "Skills used",
-            subagent: "Delegated work",
-            intent: "Session mode",
-            data: "Data references",
-            role: "Behavioral directives",
-          };
-
-          const categoryHints: Record<string, string> = {
-            file: "Restored after compact — no need to re-read",
-            rule: "Your project instructions survive context resets",
-            prompt: "Continues exactly where you left off",
-            decision: "Applied automatically — won't ask again",
-            task: "Picks up from where it stopped",
-            error: "Tracked and monitored across compacts",
-            git: "Branch, commit, and repo state preserved",
-            env: "Runtime config carried forward",
-            mcp: "Tool usage patterns remembered",
-            subagent: "Delegation history preserved",
-            skill: "Skill invocations tracked",
-          };
-
-          lines.push(
-            "",
-            "### Session Continuity",
-            "",
-            "| What's preserved | Count | I remember... | Why it matters |",
-            "|------------------|------:|---------------|----------------|",
-          );
-          for (const row of byCategory) {
-            const label = categoryLabels[row.category] || row.category;
-            const preview = previews.get(row.category);
-            const previewStr = preview ? Array.from(preview).join(", ") : "";
-            const hint = categoryHints[row.category] || "Survives context resets";
-            lines.push(`| ${label} | ${row.cnt} | ${previewStr} | ${hint} |`);
-          }
-          lines.push(`| **Total** | **${eventTotal.cnt}** | | **Zero knowledge lost on compact** |`);
-
-          lines.push("");
-          if (compacts > 0) {
-            lines.push(`Context has been compacted **${compacts} time(s)** — session knowledge was preserved each time.`);
-          } else {
-            lines.push(`When your context compacts, all of this will restore Claude's awareness — no starting from scratch.`);
-          }
-          if (resume && !resume.consumed) {
-            lines.push(`Resume snapshot ready (${resume.event_count} events) for the next compaction.`);
-          }
-
-          lines.push("");
-          lines.push(`> **Note:** Previous session data is loaded when you start a new session. Without \`--continue\`, old session history is cleaned up to keep the database lean.`);
         }
 
-        sdb.close();
+        const categoryLabels: Record<string, string> = {
+          file: "Files tracked",
+          rule: "Project rules (CLAUDE.md)",
+          prompt: "Your requests saved",
+          mcp: "Plugin tools used",
+          git: "Git operations",
+          env: "Environment setup",
+          error: "Errors caught",
+          task: "Tasks in progress",
+          decision: "Your decisions",
+          cwd: "Working directory",
+          skill: "Skills used",
+          subagent: "Delegated work",
+          intent: "Session mode",
+          data: "Data references",
+          role: "Behavioral directives",
+        };
+
+        const categoryHints: Record<string, string> = {
+          file: "Restored after compact — no need to re-read",
+          rule: "Your project instructions survive context resets",
+          prompt: "Continues exactly where you left off",
+          decision: "Applied automatically — won't ask again",
+          task: "Picks up from where it stopped",
+          error: "Tracked and monitored across compacts",
+          git: "Branch, commit, and repo state preserved",
+          env: "Runtime config carried forward",
+          mcp: "Tool usage patterns remembered",
+          subagent: "Delegation history preserved",
+          skill: "Skill invocations tracked",
+        };
+
+        lines.push(
+          "",
+          "### Session Continuity",
+          "",
+          "| What's preserved | Count | I remember... | Why it matters |",
+          "|------------------|------:|---------------|----------------|",
+        );
+        for (const row of byCategory) {
+          const label = categoryLabels[row.category] || row.category;
+          const preview = previews.get(row.category);
+          const previewStr = preview ? Array.from(preview).join(", ") : "";
+          const hint = categoryHints[row.category] || "Survives context resets";
+          lines.push(`| ${label} | ${row.cnt} | ${previewStr} | ${hint} |`);
+        }
+        lines.push(`| **Total** | **${eventTotal}** | | **Zero knowledge lost on compact** |`);
+
+        lines.push("");
+        if (compacts > 0) {
+          lines.push(`Context has been compacted **${compacts} time(s)** — session knowledge was preserved each time.`);
+        } else {
+          lines.push(`When your context compacts, all of this will restore Claude's awareness — no starting from scratch.`);
+        }
+        if (resumeHit && !resumeHit.consumed) {
+          lines.push(`Resume snapshot ready (${resumeHit.event_count} events) for the next compaction.`);
+        }
+
+        lines.push("");
+        lines.push(`> **Note:** Previous session data is loaded when you start a new session. Without \`--continue\`, old session history is cleaned up to keep the index lean.`);
       }
+
+      await sessionStore.close();
     } catch {
-      // Session DB not available or incompatible — skip silently
+      // Session store not available — skip silently
     }
 
     // No separate DevRel summary — integrated into feature sections above
@@ -1715,7 +1764,7 @@ server.registerTool(
 
 async function main() {
   // Clean up stale DB files from previous sessions
-  const cleaned = cleanupStaleDBs();
+  const cleaned = cleanupStaleIndices();
   if (cleaned > 0) {
     console.error(`Cleaned up ${cleaned} stale DB file(s) from previous sessions`);
   }
@@ -1723,10 +1772,12 @@ async function main() {
   // Clean up own DB + backgrounded processes on shutdown
   const shutdown = () => {
     executor.cleanupBackgrounded();
-    if (_store) _store.cleanup();
+    // ES cleanup is async — handled in gracefulShutdown for SIGINT/SIGTERM
+    // process.on("exit") cannot run async code (per D-13)
   };
   const gracefulShutdown = async () => {
-    shutdown();
+    executor.cleanupBackgrounded();
+    if (_store) await _store.close();
     process.exit(0);
   };
   process.on("exit", shutdown);
