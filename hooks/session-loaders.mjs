@@ -1,9 +1,9 @@
 /**
- * Session module loaders — bundle-only.
+ * Session module loaders — bundle + ES-backed.
  *
- * All session modules are loaded from esbuild bundles (hooks/session-*.bundle.mjs).
- * Bundles are built by CI (bundle.yml) and shipped with every release.
- * No fallback to build/ — if the bundle is missing, the error surfaces immediately.
+ * Bundle loaders (loadExtract, loadSnapshot) load from esbuild bundles.
+ * Session store is now ES-backed — loadSessionStore() returns the ES module.
+ * loadSessionDB() is kept as a deprecated alias during transition.
  */
 
 import { join } from "node:path";
@@ -14,9 +14,18 @@ export function createSessionLoaders(hookDir) {
     ? join(hookDir, "..")
     : hookDir;
 
+  // Resolve the ES-backed session store from the build output
+  const pkgRoot = join(bundleDir, "..");
+  const esDbPath = join(pkgRoot, "build", "session", "es-db.js");
+
   return {
+    /** Load the ES-backed SessionStore. */
+    async loadSessionStore() {
+      return await import(pathToFileURL(esDbPath).href);
+    },
+    /** @deprecated Use loadSessionStore() instead. */
     async loadSessionDB() {
-      return await import(pathToFileURL(join(bundleDir, "session-db.bundle.mjs")).href);
+      return await import(pathToFileURL(esDbPath).href);
     },
     async loadExtract() {
       return await import(pathToFileURL(join(bundleDir, "session-extract.bundle.mjs")).href);

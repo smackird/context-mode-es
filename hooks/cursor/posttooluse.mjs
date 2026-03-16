@@ -1,15 +1,16 @@
 #!/usr/bin/env node
 import "../suppress-stderr.mjs";
 /**
- * Cursor postToolUse hook — session event capture.
+ * Cursor postToolUse hook — session event capture (ES-backed).
  */
 
-import { readStdin, getSessionId, getSessionDBPath, getInputProjectDir, CURSOR_OPTS } from "../session-helpers.mjs";
+import { readStdin, getSessionId, getSessionIndexName, getInputProjectDir, CURSOR_OPTS } from "../session-helpers.mjs";
 import { join, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const HOOK_DIR = dirname(fileURLToPath(import.meta.url));
-const PKG_SESSION = join(HOOK_DIR, "..", "..", "build", "session");
+const PKG_ROOT = join(HOOK_DIR, "..", "..");
+const PKG_SESSION = join(PKG_ROOT, "build", "session");
 const OPTS = CURSOR_OPTS;
 
 function normalizeToolName(toolName) {
@@ -36,13 +37,16 @@ try {
   }
 
   const { extractEvents } = await import(pathToFileURL(join(PKG_SESSION, "extract.js")).href);
-  const { SessionDB } = await import(pathToFileURL(join(PKG_SESSION, "db.js")).href);
+  const { loadElasticConfig, getClient } = await import(pathToFileURL(join(PKG_ROOT, "build", "es-base.js")).href);
+  const { SessionStore } = await import(pathToFileURL(join(PKG_ROOT, "build", "session", "es-db.js")).href);
 
-  const dbPath = getSessionDBPath(OPTS);
-  const db = new SessionDB({ dbPath });
+  loadElasticConfig();
+  const client = getClient();
+  const indexName = getSessionIndexName(OPTS);
+  const store = await SessionStore.create(client, indexName);
   const sessionId = getSessionId(input, OPTS);
 
-  db.ensureSession(sessionId, projectDir);
+  await store.ensureSession(sessionId, projectDir);
 
   const normalizedInput = {
     tool_name: normalizeToolName(input.tool_name ?? ""),
@@ -57,14 +61,12 @@ try {
 
   const events = extractEvents(normalizedInput);
   for (const event of events) {
-    db.insertEvent(sessionId, event, "PostToolUse");
+    await store.insertEvent(sessionId, event, "PostToolUse");
   }
 
-  db.close();
+  await store.close();
 } catch {
   // Cursor treats stderr as hook failure; swallow and continue.
 }
 
-// Cursor treats empty stdout as an invalid hook response,
-// so we emit an explicit no-op payload after persisting events.
 process.stdout.write(JSON.stringify({ additional_context: "" }) + "\n");

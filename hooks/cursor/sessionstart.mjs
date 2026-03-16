@@ -1,23 +1,24 @@
 #!/usr/bin/env node
 import "../suppress-stderr.mjs";
 /**
- * Cursor sessionStart hook for context-mode.
+ * Cursor sessionStart hook for context-mode (ES-backed).
  */
 
 import { ROUTING_BLOCK } from "../routing-block.mjs";
 import {
   writeSessionEventsFile,
   buildSessionDirective,
-  getSessionEvents,
-  getLatestSessionEvents,
+  getSessionEventsES,
+  getLatestSessionEventsES,
 } from "../session-directive.mjs";
 import {
   readStdin,
   getSessionId,
-  getSessionDBPath,
+  getSessionIndexName,
   getSessionEventsPath,
   getCleanupFlagPath,
   getInputProjectDir,
+  deleteOrphanEventsES,
   CURSOR_OPTS,
 } from "../session-helpers.mjs";
 import { join } from "node:path";
@@ -25,7 +26,7 @@ import { readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const HOOK_DIR = fileURLToPath(new URL(".", import.meta.url));
-const PKG_SESSION = join(HOOK_DIR, "..", "..", "build", "session");
+const PKG_ROOT = join(HOOK_DIR, "..", "..");
 const OPTS = CURSOR_OPTS;
 
 let additionalContext = ROUTING_BLOCK;
@@ -40,34 +41,35 @@ try {
     process.env.CURSOR_CWD = projectDir;
   }
 
-  if (source === "compact" || source === "resume") {
-    const { SessionDB } = await import(pathToFileURL(join(PKG_SESSION, "db.js")).href);
-    const dbPath = getSessionDBPath(OPTS);
-    const db = new SessionDB({ dbPath });
+  const { loadElasticConfig, getClient } = await import(pathToFileURL(join(PKG_ROOT, "build", "es-base.js")).href);
+  const { SessionStore } = await import(pathToFileURL(join(PKG_ROOT, "build", "session", "es-db.js")).href);
 
+  loadElasticConfig();
+  const client = getClient();
+  const indexName = getSessionIndexName(OPTS);
+  const store = await SessionStore.create(client, indexName);
+
+  if (source === "compact" || source === "resume") {
     if (source === "compact") {
       const sessionId = getSessionId(input, OPTS);
-      const resume = db.getResume(sessionId);
+      const resume = await store.getResume(sessionId);
       if (resume && !resume.consumed) {
-        db.markResumeConsumed(sessionId);
+        await store.markResumeConsumed(sessionId);
       }
     } else {
       try { unlinkSync(getCleanupFlagPath(OPTS)); } catch { /* no flag */ }
     }
 
     const events = source === "compact"
-      ? getSessionEvents(db, getSessionId(input, OPTS))
-      : getLatestSessionEvents(db);
+      ? await getSessionEventsES(client, indexName, getSessionId(input, OPTS))
+      : await getLatestSessionEventsES(client, indexName);
     if (events.length > 0) {
       const eventMeta = writeSessionEventsFile(events, getSessionEventsPath(OPTS));
       additionalContext += buildSessionDirective(source, eventMeta);
     }
 
-    db.close();
+    await store.close();
   } else if (source === "startup") {
-    const { SessionDB } = await import(pathToFileURL(join(PKG_SESSION, "db.js")).href);
-    const dbPath = getSessionDBPath(OPTS);
-    const db = new SessionDB({ dbPath });
     try { unlinkSync(getSessionEventsPath(OPTS)); } catch { /* no stale file */ }
 
     const cleanupFlag = getCleanupFlagPath(OPTS);
@@ -75,23 +77,21 @@ try {
     try { readFileSync(cleanupFlag); previousWasFresh = true; } catch { /* no flag */ }
 
     if (previousWasFresh) {
-      db.cleanupOldSessions(0);
+      await store.cleanupOldSessions(0);
     } else {
-      db.cleanupOldSessions(7);
+      await store.cleanupOldSessions(7);
     }
-    db.db.exec(`DELETE FROM session_events WHERE session_id NOT IN (SELECT session_id FROM session_meta)`);
+    await deleteOrphanEventsES(client, indexName);
     writeFileSync(cleanupFlag, new Date().toISOString(), "utf-8");
 
     const sessionId = getSessionId(input, OPTS);
-    db.ensureSession(sessionId, projectDir);
+    await store.ensureSession(sessionId, projectDir);
 
-    db.close();
+    await store.close();
   }
   // clear => routing block only
 } catch {
   // Cursor treats stderr as hook failure; swallow and continue.
 }
 
-// Cursor treats empty stdout as an invalid hook response,
-// so SessionStart always emits an explicit additional_context payload.
 process.stdout.write(JSON.stringify({ additional_context: additionalContext }) + "\n");

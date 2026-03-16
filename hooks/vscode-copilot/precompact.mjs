@@ -1,22 +1,19 @@
 #!/usr/bin/env node
 import "../suppress-stderr.mjs";
 /**
- * VS Code Copilot PreCompact hook — snapshot generation.
- *
- * Triggered when VS Code Copilot is about to compact the conversation.
- * Reads all captured session events, builds a priority-sorted resume
- * snapshot (<2KB XML), and stores it for injection after compact.
+ * VS Code Copilot PreCompact hook — snapshot generation (ES-backed).
  */
 
 import { createSessionLoaders } from "../session-loaders.mjs";
-import { readStdin, getSessionId, getSessionDBPath, VSCODE_OPTS } from "../session-helpers.mjs";
+import { readStdin, getSessionId, getSessionIndexName, VSCODE_OPTS } from "../session-helpers.mjs";
 import { appendFileSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { homedir } from "node:os";
 
 const HOOK_DIR = dirname(fileURLToPath(import.meta.url));
-const { loadSessionDB, loadSnapshot } = createSessionLoaders(HOOK_DIR);
+const PKG_ROOT = join(HOOK_DIR, "..", "..");
+const { loadSnapshot } = createSessionLoaders(HOOK_DIR);
 const OPTS = VSCODE_OPTS;
 const DEBUG_LOG = join(homedir(), ".vscode", "context-mode", "precompact-debug.log");
 
@@ -25,25 +22,28 @@ try {
   const input = JSON.parse(raw);
 
   const { buildResumeSnapshot } = await loadSnapshot();
-  const { SessionDB } = await loadSessionDB();
+  const { loadElasticConfig, getClient } = await import(pathToFileURL(join(PKG_ROOT, "build", "es-base.js")).href);
+  const { SessionStore } = await import(pathToFileURL(join(PKG_ROOT, "build", "session", "es-db.js")).href);
 
-  const dbPath = getSessionDBPath(OPTS);
-  const db = new SessionDB({ dbPath });
+  loadElasticConfig();
+  const client = getClient();
+  const indexName = getSessionIndexName(OPTS);
+  const store = await SessionStore.create(client, indexName);
   const sessionId = getSessionId(input, OPTS);
 
-  const events = db.getEvents(sessionId);
+  const events = await store.getEvents(sessionId);
 
   if (events.length > 0) {
-    const stats = db.getSessionStats(sessionId);
+    const stats = await store.getSessionStats(sessionId);
     const snapshot = buildResumeSnapshot(events, {
       compactCount: (stats?.compact_count ?? 0) + 1,
     });
 
-    db.upsertResume(sessionId, snapshot, events.length);
-    db.incrementCompactCount(sessionId);
+    await store.upsertResume(sessionId, snapshot, events.length);
+    await store.incrementCompactCount(sessionId);
   }
 
-  db.close();
+  await store.close();
 } catch (err) {
   try {
     appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] ${err?.message || err}\n`);

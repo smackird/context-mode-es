@@ -4,36 +4,35 @@ import "./suppress-stderr.mjs";
  * PostToolUse hook for context-mode session continuity.
  *
  * Captures session events from tool calls (13 categories) and stores
- * them in the per-project SessionDB for later resume snapshot building.
- *
- * Must be fast (<20ms). No network, no LLM, just SQLite writes.
+ * them in the per-project SessionStore (ES-backed) for later resume
+ * snapshot building.
  */
 
-import { readStdin, getSessionId, getSessionDBPath } from "./session-helpers.mjs";
+import { readStdin, getSessionId, getSessionIndexName } from "./session-helpers.mjs";
 import { createSessionLoaders } from "./session-loaders.mjs";
-import { dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join, dirname } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
-// Resolve absolute path for imports — relative dynamic imports can fail
-// when Claude Code invokes hooks from a different working directory.
 const HOOK_DIR = dirname(fileURLToPath(import.meta.url));
-const { loadSessionDB, loadExtract } = createSessionLoaders(HOOK_DIR);
+const PKG_ROOT = join(HOOK_DIR, "..");
+const { loadExtract } = createSessionLoaders(HOOK_DIR);
 
 try {
   const raw = await readStdin();
   const input = JSON.parse(raw);
 
   const { extractEvents } = await loadExtract();
-  const { SessionDB } = await loadSessionDB();
+  const { loadElasticConfig, getClient } = await import(pathToFileURL(join(PKG_ROOT, "build", "es-base.js")).href);
+  const { SessionStore } = await import(pathToFileURL(join(PKG_ROOT, "build", "session", "es-db.js")).href);
 
-  const dbPath = getSessionDBPath();
-  const db = new SessionDB({ dbPath });
+  loadElasticConfig();
+  const client = getClient();
+  const indexName = getSessionIndexName();
+  const store = await SessionStore.create(client, indexName);
   const sessionId = getSessionId(input);
 
-  // Ensure session meta exists
-  db.ensureSession(sessionId, process.env.CLAUDE_PROJECT_DIR || process.cwd());
+  await store.ensureSession(sessionId, process.env.CLAUDE_PROJECT_DIR || process.cwd());
 
-  // Extract and store events
   const events = extractEvents({
     tool_name: input.tool_name,
     tool_input: input.tool_input ?? {},
@@ -44,10 +43,10 @@ try {
   });
 
   for (const event of events) {
-    db.insertEvent(sessionId, event, "PostToolUse");
+    await store.insertEvent(sessionId, event, "PostToolUse");
   }
 
-  db.close();
+  await store.close();
 } catch {
   // PostToolUse must never block the session — silent fallback
 }

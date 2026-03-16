@@ -5,17 +5,16 @@ import "./suppress-stderr.mjs";
  *
  * Captures every user prompt so the LLM can continue from the exact
  * point where the user left off after compact or session restart.
- *
- * Must be fast (<10ms). Just a single SQLite write.
  */
 
-import { readStdin, getSessionId, getSessionDBPath } from "./session-helpers.mjs";
+import { readStdin, getSessionId, getSessionIndexName } from "./session-helpers.mjs";
 import { createSessionLoaders } from "./session-loaders.mjs";
-import { dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join, dirname } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const HOOK_DIR = dirname(fileURLToPath(import.meta.url));
-const { loadSessionDB, loadExtract } = createSessionLoaders(HOOK_DIR);
+const PKG_ROOT = join(HOOK_DIR, "..");
+const { loadExtract } = createSessionLoaders(HOOK_DIR);
 
 try {
   const raw = await readStdin();
@@ -24,36 +23,38 @@ try {
   const prompt = input.prompt ?? input.message ?? "";
   const trimmed = (prompt || "").trim();
 
-  // Skip system-generated messages — only capture genuine user prompts
   const isSystemMessage = trimmed.startsWith("<task-notification>")
     || trimmed.startsWith("<system-reminder>")
     || trimmed.startsWith("<context_guidance>")
     || trimmed.startsWith("<tool-result>");
 
   if (trimmed.length > 0 && !isSystemMessage) {
-    const { SessionDB } = await loadSessionDB();
     const { extractUserEvents } = await loadExtract();
-    const dbPath = getSessionDBPath();
-    const db = new SessionDB({ dbPath });
+    const { loadElasticConfig, getClient } = await import(pathToFileURL(join(PKG_ROOT, "build", "es-base.js")).href);
+    const { SessionStore } = await import(pathToFileURL(join(PKG_ROOT, "build", "session", "es-db.js")).href);
+
+    loadElasticConfig();
+    const client = getClient();
+    const indexName = getSessionIndexName();
+    const store = await SessionStore.create(client, indexName);
     const sessionId = getSessionId(input);
 
-    db.ensureSession(sessionId, process.env.CLAUDE_PROJECT_DIR || process.cwd());
+    await store.ensureSession(sessionId, process.env.CLAUDE_PROJECT_DIR || process.cwd());
 
-    // 1. Always save the raw prompt
-    db.insertEvent(sessionId, {
+    await store.insertEvent(sessionId, {
       type: "user_prompt",
       category: "prompt",
       data: prompt,
       priority: 1,
+      data_hash: "",
     }, "UserPromptSubmit");
 
-    // 2. Extract decision/role/intent/data from user message
     const userEvents = extractUserEvents(trimmed);
     for (const ev of userEvents) {
-      db.insertEvent(sessionId, ev, "UserPromptSubmit");
+      await store.insertEvent(sessionId, ev, "UserPromptSubmit");
     }
 
-    db.close();
+    await store.close();
   }
 } catch {
   // UserPromptSubmit must never block the session — silent fallback

@@ -1,25 +1,12 @@
 /**
- * Suppress stderr at the OS file descriptor level.
+ * suppress-stderr.mjs — No-op stub.
  *
- * Native C++ modules (better-sqlite3) write directly to fd 2 during
- * initialization, bypassing Node.js process.stderr. Platforms like
- * Claude Code interpret ANY stderr output as hook failure.
+ * This file previously suppressed stderr for better-sqlite3 native module noise.
+ * Now that we use @elastic/elasticsearch (pure JS), stderr suppression is unnecessary.
  *
- * This module MUST be the first import in every hook entry point.
- * ESM evaluates imports depth-first in declaration order, so importing
- * this module first ensures fd 2 is redirected to /dev/null before
- * any native modules are loaded.
+ * The file is kept as an empty stub to prevent ERR_MODULE_NOT_FOUND for:
+ * - pretooluse.mjs variants (which still import this file but don't use SessionDB)
+ * - Any third-party hooks that import this file
  *
- * Cross-platform: os.devNull → /dev/null (Unix) or \\.\NUL (Windows).
- * See: https://github.com/mksglu/context-mode/issues/68
+ * Will be deleted entirely in Phase 7 cleanup.
  */
-import { closeSync, openSync } from "node:fs";
-import { devNull } from "node:os";
-
-try {
-  closeSync(2);
-  openSync(devNull, "w"); // Acquires fd 2 (lowest available)
-} catch {
-  // Fallback: suppress at Node.js stream level
-  process.stderr.write = /** @type {any} */ (() => true);
-}

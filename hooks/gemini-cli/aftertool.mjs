@@ -1,22 +1,18 @@
 #!/usr/bin/env node
 import "../suppress-stderr.mjs";
 /**
- * Gemini CLI AfterTool hook — session event capture.
- *
- * Captures session events from tool calls (13 categories) and stores
- * them in the per-project SessionDB for later resume snapshot building.
- *
- * Must be fast (<20ms). No network, no LLM, just SQLite writes.
+ * Gemini CLI AfterTool hook — session event capture (ES-backed).
  */
 
-import { readStdin, getSessionId, getSessionDBPath, getProjectDir, GEMINI_OPTS } from "../session-helpers.mjs";
+import { readStdin, getSessionId, getSessionIndexName, getProjectDir, GEMINI_OPTS } from "../session-helpers.mjs";
 import { appendFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const HOOK_DIR = dirname(fileURLToPath(import.meta.url));
-const PKG_SESSION = join(HOOK_DIR, "..", "..", "build", "session");
+const PKG_ROOT = join(HOOK_DIR, "..", "..");
+const PKG_SESSION = join(PKG_ROOT, "build", "session");
 const OPTS = GEMINI_OPTS;
 const DEBUG_LOG = join(homedir(), ".gemini", "context-mode", "aftertool-debug.log");
 
@@ -27,13 +23,16 @@ try {
   appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] CALL: ${input.tool_name}\n`);
 
   const { extractEvents } = await import(pathToFileURL(join(PKG_SESSION, "extract.js")).href);
-  const { SessionDB } = await import(pathToFileURL(join(PKG_SESSION, "db.js")).href);
+  const { loadElasticConfig, getClient } = await import(pathToFileURL(join(PKG_ROOT, "build", "es-base.js")).href);
+  const { SessionStore } = await import(pathToFileURL(join(PKG_ROOT, "build", "session", "es-db.js")).href);
 
-  const dbPath = getSessionDBPath(OPTS);
-  const db = new SessionDB({ dbPath });
+  loadElasticConfig();
+  const client = getClient();
+  const indexName = getSessionIndexName(OPTS);
+  const store = await SessionStore.create(client, indexName);
   const sessionId = getSessionId(input, OPTS);
 
-  db.ensureSession(sessionId, getProjectDir(OPTS));
+  await store.ensureSession(sessionId, getProjectDir(OPTS));
 
   const events = extractEvents({
     tool_name: input.tool_name,
@@ -45,11 +44,11 @@ try {
   });
 
   for (const event of events) {
-    db.insertEvent(sessionId, event, "AfterTool");
+    await store.insertEvent(sessionId, event, "AfterTool");
   }
 
   appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] OK: ${input.tool_name} → ${events.length} events\n`);
-  db.close();
+  await store.close();
 } catch (err) {
   try {
     appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] ERR: ${err?.message || err}\n`);

@@ -6,26 +6,18 @@ import "./suppress-stderr.mjs";
  * Provides the agent with XML-structured "Rules of Engagement"
  * at the beginning of each session. Injects session knowledge on
  * both startup and compact to maintain continuity.
- *
- * Session Lifecycle Rules:
- * - "startup"  → Fresh session. Inject previous session knowledge. Cleanup old data.
- * - "compact"  → Auto-compact triggered. Inject resume snapshot + stats.
- * - "resume"   → User used --continue. Full history, no resume needed.
- * - "clear"    → User cleared context. No resume.
  */
 
 import { ROUTING_BLOCK } from "./routing-block.mjs";
-import { readStdin, getSessionId, getSessionDBPath, getSessionEventsPath, getCleanupFlagPath } from "./session-helpers.mjs";
-import { writeSessionEventsFile, buildSessionDirective, getSessionEvents, getLatestSessionEvents } from "./session-directive.mjs";
-import { createSessionLoaders } from "./session-loaders.mjs";
+import { readStdin, getSessionId, getSessionIndexName, getSessionEventsPath, getCleanupFlagPath, deleteOrphanEventsES } from "./session-helpers.mjs";
+import { writeSessionEventsFile, buildSessionDirective, getSessionEventsES, getLatestSessionEventsES } from "./session-directive.mjs";
 import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 
-// Resolve absolute path for imports (fileURLToPath for Windows compat)
 const HOOK_DIR = dirname(fileURLToPath(import.meta.url));
-const { loadSessionDB } = createSessionLoaders(HOOK_DIR);
+const PKG_ROOT = join(HOOK_DIR, "..");
 
 let additionalContext = ROUTING_BLOCK;
 
@@ -34,72 +26,59 @@ try {
   const input = JSON.parse(raw);
   const source = input.source ?? "startup";
 
+  const { loadElasticConfig, getClient } = await import(pathToFileURL(join(PKG_ROOT, "build", "es-base.js")).href);
+  const { SessionStore } = await import(pathToFileURL(join(PKG_ROOT, "build", "session", "es-db.js")).href);
+
+  loadElasticConfig();
+  const client = getClient();
+  const indexName = getSessionIndexName();
+  const store = await SessionStore.create(client, indexName);
+
   if (source === "compact") {
-    // Session was compacted — write events to file for auto-indexing, inject directive only
-    const { SessionDB } = await loadSessionDB();
-    const dbPath = getSessionDBPath();
-    const db = new SessionDB({ dbPath });
     const sessionId = getSessionId(input);
-    const resume = db.getResume(sessionId);
+    const resume = await store.getResume(sessionId);
 
     if (resume && !resume.consumed) {
-      db.markResumeConsumed(sessionId);
+      await store.markResumeConsumed(sessionId);
     }
 
-    const events = getSessionEvents(db, sessionId);
+    const events = await getSessionEventsES(client, indexName, sessionId);
     if (events.length > 0) {
       const eventMeta = writeSessionEventsFile(events, getSessionEventsPath());
       additionalContext += buildSessionDirective("compact", eventMeta);
     }
 
-    db.close();
+    await store.close();
   } else if (source === "resume") {
-    // User used --continue — clear cleanup flag so startup doesn't wipe data
     try { unlinkSync(getCleanupFlagPath()); } catch { /* no flag */ }
 
-    const { SessionDB } = await loadSessionDB();
-    const dbPath = getSessionDBPath();
-    const db = new SessionDB({ dbPath });
-
-    const events = getLatestSessionEvents(db);
+    const events = await getLatestSessionEventsES(client, indexName);
     if (events.length > 0) {
       const eventMeta = writeSessionEventsFile(events, getSessionEventsPath());
       additionalContext += buildSessionDirective("resume", eventMeta);
     }
 
-    db.close();
+    await store.close();
   } else if (source === "startup") {
-    // Fresh session (no --continue) — clean slate, capture CLAUDE.md rules.
-    const { SessionDB } = await loadSessionDB();
-    const dbPath = getSessionDBPath();
-    const db = new SessionDB({ dbPath });
     try { unlinkSync(getSessionEventsPath()); } catch { /* no stale file */ }
 
-    // Detect true fresh start vs --continue (which fires startup→resume).
-    // If cleanup flag exists from a PREVIOUS startup that was never followed by
-    // resume, that was a true fresh start — aggressively wipe all data.
     const cleanupFlag = getCleanupFlagPath();
     let previousWasFresh = false;
     try { readFileSync(cleanupFlag); previousWasFresh = true; } catch { /* no flag */ }
 
     if (previousWasFresh) {
-      // Previous session was a true fresh start (no --continue) — clean slate
-      db.cleanupOldSessions(0);
+      await store.cleanupOldSessions(0);
     } else {
-      // First startup or --continue will follow — only clean old sessions
-      db.cleanupOldSessions(7);
+      await store.cleanupOldSessions(7);
     }
-    db.db.exec(`DELETE FROM session_events WHERE session_id NOT IN (SELECT session_id FROM session_meta)`);
+    await deleteOrphanEventsES(client, indexName);
 
-    // Write cleanup flag — resume will delete it if --continue follows
     writeFileSync(cleanupFlag, new Date().toISOString(), "utf-8");
 
-    // Proactively capture CLAUDE.md files — Claude Code loads them as system
-    // context at startup, invisible to PostToolUse hooks. We read them from
-    // disk so they survive compact/resume via the session events pipeline.
     const sessionId = getSessionId(input);
     const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
-    db.ensureSession(sessionId, projectDir);
+    await store.ensureSession(sessionId, projectDir);
+
     const claudeMdPaths = [
       join(homedir(), ".claude", "CLAUDE.md"),
       join(projectDir, "CLAUDE.md"),
@@ -109,17 +88,16 @@ try {
       try {
         const content = readFileSync(p, "utf-8");
         if (content.trim()) {
-          db.insertEvent(sessionId, { type: "rule", category: "rule", data: p, priority: 1 });
-          db.insertEvent(sessionId, { type: "rule_content", category: "rule", data: content, priority: 1 });
+          await store.insertEvent(sessionId, { type: "rule", category: "rule", data: p, priority: 1, data_hash: "" });
+          await store.insertEvent(sessionId, { type: "rule_content", category: "rule", data: content, priority: 1, data_hash: "" });
         }
       } catch { /* file doesn't exist — skip */ }
     }
 
-    db.close();
+    await store.close();
   }
   // "clear" — no action needed
 } catch (err) {
-  // Session continuity is best-effort — never block session start
   try {
     const { appendFileSync } = await import("node:fs");
     const { join: pjoin } = await import("node:path");

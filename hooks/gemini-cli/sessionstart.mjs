@@ -1,20 +1,14 @@
 #!/usr/bin/env node
 import "../suppress-stderr.mjs";
 /**
- * Gemini CLI SessionStart hook for context-mode
- *
- * Session lifecycle management:
- * - "startup"  → Cleanup old sessions, capture GEMINI.md rules
- * - "compact"  → Write events file, inject session knowledge directive
- * - "resume"   → Load previous session events, inject directive
- * - "clear"    → No action needed
+ * Gemini CLI SessionStart hook for context-mode (ES-backed).
  */
 
 import { ROUTING_BLOCK } from "../routing-block.mjs";
-import { writeSessionEventsFile, buildSessionDirective, getSessionEvents, getLatestSessionEvents } from "../session-directive.mjs";
+import { writeSessionEventsFile, buildSessionDirective, getSessionEventsES, getLatestSessionEventsES } from "../session-directive.mjs";
 import {
-  readStdin, getSessionId, getSessionDBPath, getSessionEventsPath, getCleanupFlagPath,
-  getProjectDir, GEMINI_OPTS,
+  readStdin, getSessionId, getSessionIndexName, getSessionEventsPath, getCleanupFlagPath,
+  getProjectDir, deleteOrphanEventsES, GEMINI_OPTS,
 } from "../session-helpers.mjs";
 import { join, dirname } from "node:path";
 import { readFileSync, writeFileSync, unlinkSync } from "node:fs";
@@ -22,7 +16,7 @@ import { homedir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const HOOK_DIR = dirname(fileURLToPath(import.meta.url));
-const PKG_SESSION = join(HOOK_DIR, "..", "..", "build", "session");
+const PKG_ROOT = join(HOOK_DIR, "..", "..");
 const OPTS = GEMINI_OPTS;
 
 let additionalContext = ROUTING_BLOCK;
@@ -32,42 +26,40 @@ try {
   const input = JSON.parse(raw);
   const source = input.source ?? "startup";
 
+  const { loadElasticConfig, getClient } = await import(pathToFileURL(join(PKG_ROOT, "build", "es-base.js")).href);
+  const { SessionStore } = await import(pathToFileURL(join(PKG_ROOT, "build", "session", "es-db.js")).href);
+
+  loadElasticConfig();
+  const client = getClient();
+  const indexName = getSessionIndexName(OPTS);
+  const store = await SessionStore.create(client, indexName);
+
   if (source === "compact") {
-    const { SessionDB } = await import(pathToFileURL(join(PKG_SESSION, "db.js")).href);
-    const dbPath = getSessionDBPath(OPTS);
-    const db = new SessionDB({ dbPath });
     const sessionId = getSessionId(input, OPTS);
-    const resume = db.getResume(sessionId);
+    const resume = await store.getResume(sessionId);
 
     if (resume && !resume.consumed) {
-      db.markResumeConsumed(sessionId);
+      await store.markResumeConsumed(sessionId);
     }
 
-    const events = getSessionEvents(db, sessionId);
+    const events = await getSessionEventsES(client, indexName, sessionId);
     if (events.length > 0) {
       const eventMeta = writeSessionEventsFile(events, getSessionEventsPath(OPTS));
       additionalContext += buildSessionDirective("compact", eventMeta);
     }
 
-    db.close();
+    await store.close();
   } else if (source === "resume") {
     try { unlinkSync(getCleanupFlagPath(OPTS)); } catch { /* no flag */ }
 
-    const { SessionDB } = await import(pathToFileURL(join(PKG_SESSION, "db.js")).href);
-    const dbPath = getSessionDBPath(OPTS);
-    const db = new SessionDB({ dbPath });
-
-    const events = getLatestSessionEvents(db);
+    const events = await getLatestSessionEventsES(client, indexName);
     if (events.length > 0) {
       const eventMeta = writeSessionEventsFile(events, getSessionEventsPath(OPTS));
       additionalContext += buildSessionDirective("resume", eventMeta);
     }
 
-    db.close();
+    await store.close();
   } else if (source === "startup") {
-    const { SessionDB } = await import(pathToFileURL(join(PKG_SESSION, "db.js")).href);
-    const dbPath = getSessionDBPath(OPTS);
-    const db = new SessionDB({ dbPath });
     try { unlinkSync(getSessionEventsPath(OPTS)); } catch { /* no stale file */ }
 
     const cleanupFlag = getCleanupFlagPath(OPTS);
@@ -75,22 +67,21 @@ try {
     try { readFileSync(cleanupFlag); previousWasFresh = true; } catch { /* no flag */ }
 
     if (previousWasFresh) {
-      db.cleanupOldSessions(0);
+      await store.cleanupOldSessions(0);
     } else {
-      db.cleanupOldSessions(7);
+      await store.cleanupOldSessions(7);
     }
-    db.db.exec(`DELETE FROM session_events WHERE session_id NOT IN (SELECT session_id FROM session_meta)`);
+    await deleteOrphanEventsES(client, indexName);
     writeFileSync(cleanupFlag, new Date().toISOString(), "utf-8");
 
     const sessionId = getSessionId(input, OPTS);
     const projectDir = getProjectDir(OPTS);
-    db.ensureSession(sessionId, projectDir);
+    await store.ensureSession(sessionId, projectDir);
 
-    // Auto-write GEMINI.md on startup if missing or not merged yet
     try {
-      const { GeminiCLIAdapter } = await import(pathToFileURL(join(HOOK_DIR, "..", "..", "build", "adapters", "gemini-cli", "index.js")).href);
-      new GeminiCLIAdapter().writeRoutingInstructions(projectDir, join(HOOK_DIR, "..", ".."));
-    } catch { /* best effort — don't block session start */ }
+      const { GeminiCLIAdapter } = await import(pathToFileURL(join(PKG_ROOT, "build", "adapters", "gemini-cli", "index.js")).href);
+      new GeminiCLIAdapter().writeRoutingInstructions(projectDir, PKG_ROOT);
+    } catch { /* best effort */ }
 
     const ruleFilePaths = [
       join(homedir(), ".gemini", "GEMINI.md"),
@@ -100,15 +91,14 @@ try {
       try {
         const content = readFileSync(p, "utf-8");
         if (content.trim()) {
-          db.insertEvent(sessionId, { type: "rule", category: "rule", data: p, priority: 1 });
-          db.insertEvent(sessionId, { type: "rule_content", category: "rule", data: content, priority: 1 });
+          await store.insertEvent(sessionId, { type: "rule", category: "rule", data: p, priority: 1, data_hash: "" });
+          await store.insertEvent(sessionId, { type: "rule_content", category: "rule", data: content, priority: 1, data_hash: "" });
         }
       } catch { /* file doesn't exist — skip */ }
     }
 
-    db.close();
+    await store.close();
   }
-  // "clear" — no action needed
 } catch (err) {
   try {
     const { appendFileSync } = await import("node:fs");

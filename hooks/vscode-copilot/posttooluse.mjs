@@ -1,23 +1,19 @@
 #!/usr/bin/env node
 import "../suppress-stderr.mjs";
 /**
- * VS Code Copilot PostToolUse hook — session event capture.
- *
- * Captures session events from tool calls (13 categories) and stores
- * them in the per-project SessionDB for later resume snapshot building.
- *
- * Must be fast (<20ms). No network, no LLM, just SQLite writes.
+ * VS Code Copilot PostToolUse hook — session event capture (ES-backed).
  */
 
 import { createSessionLoaders } from "../session-loaders.mjs";
-import { readStdin, getSessionId, getSessionDBPath, getProjectDir, VSCODE_OPTS } from "../session-helpers.mjs";
+import { readStdin, getSessionId, getSessionIndexName, getProjectDir, VSCODE_OPTS } from "../session-helpers.mjs";
 import { appendFileSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { homedir } from "node:os";
 
 const HOOK_DIR = dirname(fileURLToPath(import.meta.url));
-const { loadSessionDB, loadExtract } = createSessionLoaders(HOOK_DIR);
+const PKG_ROOT = join(HOOK_DIR, "..", "..");
+const { loadExtract } = createSessionLoaders(HOOK_DIR);
 const OPTS = VSCODE_OPTS;
 const DEBUG_LOG = join(homedir(), ".vscode", "context-mode", "posttooluse-debug.log");
 
@@ -28,13 +24,16 @@ try {
   appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] CALL: ${input.tool_name}\n`);
 
   const { extractEvents } = await loadExtract();
-  const { SessionDB } = await loadSessionDB();
+  const { loadElasticConfig, getClient } = await import(pathToFileURL(join(PKG_ROOT, "build", "es-base.js")).href);
+  const { SessionStore } = await import(pathToFileURL(join(PKG_ROOT, "build", "session", "es-db.js")).href);
 
-  const dbPath = getSessionDBPath(OPTS);
-  const db = new SessionDB({ dbPath });
+  loadElasticConfig();
+  const client = getClient();
+  const indexName = getSessionIndexName(OPTS);
+  const store = await SessionStore.create(client, indexName);
   const sessionId = getSessionId(input, OPTS);
 
-  db.ensureSession(sessionId, getProjectDir(OPTS));
+  await store.ensureSession(sessionId, getProjectDir(OPTS));
 
   const events = extractEvents({
     tool_name: input.tool_name,
@@ -46,11 +45,11 @@ try {
   });
 
   for (const event of events) {
-    db.insertEvent(sessionId, event, "PostToolUse");
+    await store.insertEvent(sessionId, event, "PostToolUse");
   }
 
   appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] OK: ${input.tool_name} → ${events.length} events\n`);
-  db.close();
+  await store.close();
 } catch (err) {
   try {
     appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] ERR: ${err?.message || err}\n`);
