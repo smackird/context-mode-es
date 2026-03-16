@@ -1,30 +1,31 @@
 import { strict as assert } from "node:assert";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { afterAll, describe, test } from "vitest";
 import { extractEvents, extractUserEvents } from "../../src/session/extract.js";
-import { SessionDB } from "../../src/session/db.js";
 import { buildResumeSnapshot } from "../../src/session/snapshot.js";
+import {
+  createTestSessionStore,
+  cleanupIndex,
+} from "../shared/es-test-helpers.js";
+import type { SessionStore } from "../../src/session/es-db.js";
 
-const cleanups: Array<() => void> = [];
+const cleanups: Array<() => Promise<void>> = [];
 
-afterAll(() => {
+afterAll(async () => {
   for (const fn of cleanups) {
     try {
-      fn();
+      await fn();
     } catch {
       // ignore cleanup errors
     }
   }
 });
 
-/** Create a temporary SessionDB that auto-registers for cleanup. */
-function createTestDB(): SessionDB {
-  const dbPath = join(tmpdir(), `test-pipeline-${randomUUID()}.db`);
-  const db = new SessionDB({ dbPath });
-  cleanups.push(() => db.cleanup());
-  return db;
+/** Create a temporary SessionStore that auto-registers for cleanup. */
+async function createTestStore(): Promise<SessionStore> {
+  const { store, indexName } = await createTestSessionStore();
+  cleanups.push(() => cleanupIndex(indexName));
+  return store;
 }
 
 // ════════════════════════════════════════════
@@ -32,10 +33,10 @@ function createTestDB(): SessionDB {
 // ════════════════════════════════════════════
 
 describe("1. Full Pipeline: Edit + Git + CLAUDE.md", () => {
-  test("full pipeline: extract -> store -> snapshot -> resume lifecycle", () => {
-    const db = createTestDB();
+  test("full pipeline: extract -> store -> snapshot -> resume lifecycle", async () => {
+    const store = await createTestStore();
     const sid = `pipeline-${randomUUID()}`;
-    db.ensureSession(sid, "/project");
+    await store.ensureSession(sid, "/project");
 
     // Step 1: Extract events from multiple tool calls
     const editEvents = extractEvents({
@@ -65,17 +66,17 @@ describe("1. Full Pipeline: Edit + Git + CLAUDE.md", () => {
     assert.ok(gitEvents.length >= 1, "Git checkout should produce at least 1 event");
     assert.ok(claudeMdEvents.length >= 2, "CLAUDE.md read should produce rule + file_read events");
 
-    // Step 2: Insert all events into DB
-    for (const ev of editEvents) db.insertEvent(sid, ev, "PostToolUse");
-    for (const ev of gitEvents) db.insertEvent(sid, ev, "PostToolUse");
-    for (const ev of claudeMdEvents) db.insertEvent(sid, ev, "PostToolUse");
+    // Step 2: Insert all events into store
+    for (const ev of editEvents) await store.insertEvent(sid, ev, "PostToolUse");
+    for (const ev of gitEvents) await store.insertEvent(sid, ev, "PostToolUse");
+    for (const ev of claudeMdEvents) await store.insertEvent(sid, ev, "PostToolUse");
 
     // Step 3: Build snapshot from stored events
-    const storedEvents = db.getEvents(sid);
+    const storedEvents = await store.getEvents(sid);
     const snapshot = buildResumeSnapshot(storedEvents);
 
     // Step 4: Upsert resume
-    db.upsertResume(sid, snapshot, storedEvents.length);
+    await store.upsertResume(sid, snapshot, storedEvents.length);
 
     // Step 5: Verify resume XML structure
     assert.ok(snapshot.includes("<active_files>"), "resume should contain <active_files>");
@@ -91,12 +92,12 @@ describe("1. Full Pipeline: Edit + Git + CLAUDE.md", () => {
     assert.ok(snapshot.endsWith("</session_resume>"), "should end with </session_resume>");
 
     // Step 8: Verify resume consumed lifecycle
-    const resume = db.getResume(sid);
+    const resume = await store.getResume(sid);
     assert.ok(resume !== null, "resume should exist");
     assert.equal(resume!.consumed, 0, "resume should not be consumed yet");
 
-    db.markResumeConsumed(sid);
-    const consumed = db.getResume(sid);
+    await store.markResumeConsumed(sid);
+    const consumed = await store.getResume(sid);
     assert.equal(consumed!.consumed, 1, "resume should be consumed after marking");
   });
 });
@@ -106,10 +107,10 @@ describe("1. Full Pipeline: Edit + Git + CLAUDE.md", () => {
 // ════════════════════════════════════════════
 
 describe("2. User Decisions Preserved in Resume", () => {
-  test("user decisions are preserved in resume snapshot", () => {
-    const db = createTestDB();
+  test("user decisions are preserved in resume snapshot", async () => {
+    const store = await createTestStore();
     const sid = `decisions-${randomUUID()}`;
-    db.ensureSession(sid, "/project");
+    await store.ensureSession(sid, "/project");
 
     // Extract decision event from user message
     const decisionEvents = extractUserEvents("never push to main without asking");
@@ -119,10 +120,10 @@ describe("2. User Decisions Preserved in Resume", () => {
     assert.ok(decisionEvent, "should have a decision event");
 
     // Insert the decision event
-    db.insertEvent(sid, decisionEvent!, "UserPromptSubmit");
+    await store.insertEvent(sid, decisionEvent!, "UserPromptSubmit");
 
     // Build snapshot
-    const storedEvents = db.getEvents(sid);
+    const storedEvents = await store.getEvents(sid);
     const snapshot = buildResumeSnapshot(storedEvents, { maxBytes: 4096 });
 
     // Verify the snapshot contains the decision text or rules/decisions section
@@ -140,10 +141,10 @@ describe("2. User Decisions Preserved in Resume", () => {
 // ════════════════════════════════════════════
 
 describe("3. Deduplication End-to-End", () => {
-  test("deduplication: inserting same Edit event 5 times stores only 1", () => {
-    const db = createTestDB();
+  test("deduplication: inserting same Edit event 5 times stores only 1", async () => {
+    const store = await createTestStore();
     const sid = `dedup-${randomUUID()}`;
-    db.ensureSession(sid, "/project");
+    await store.ensureSession(sid, "/project");
 
     const editInput = {
       tool_name: "Edit",
@@ -159,16 +160,16 @@ describe("3. Deduplication End-to-End", () => {
     for (let i = 0; i < 5; i++) {
       const events = extractEvents(editInput);
       for (const ev of events) {
-        db.insertEvent(sid, ev, "PostToolUse");
+        await store.insertEvent(sid, ev, "PostToolUse");
       }
     }
 
     // Should only have 1 event due to dedup
-    const count = db.getEventCount(sid);
+    const count = await store.getEventCount(sid);
     assert.equal(count, 1, `expected 1 event after dedup, got ${count}`);
 
     // Build snapshot -- file should appear only once
-    const storedEvents = db.getEvents(sid);
+    const storedEvents = await store.getEvents(sid);
     const snapshot = buildResumeSnapshot(storedEvents);
     const fileTagCount = (snapshot.match(/<file /g) || []).length;
     assert.equal(fileTagCount, 1, `expected 1 <file> tag, got ${fileTagCount}`);
@@ -180,43 +181,42 @@ describe("3. Deduplication End-to-End", () => {
 // ════════════════════════════════════════════
 
 describe("4. SessionStart Lifecycle", () => {
-  test("lifecycle: old session data, new session creation, compact, resume", () => {
-    const db = createTestDB();
+  test("lifecycle: old session data, new session creation, compact, resume", async () => {
+    const store = await createTestStore();
 
     // --- Phase 1: Create an "old" session with events and resume ---
     const oldSid = "old-session";
-    db.ensureSession(oldSid, "/project/old");
-    db.insertEvent(oldSid, {
+    await store.ensureSession(oldSid, "/project/old");
+    await store.insertEvent(oldSid, {
       type: "file",
       category: "file",
       data: "/project/old/legacy.ts",
       priority: 1,
     }, "PostToolUse");
-    db.upsertResume(oldSid, "<session_resume>old data</session_resume>", 1);
+    await store.upsertResume(oldSid, "<session_resume>old data</session_resume>", 1);
 
     // Verify old session exists
-    assert.ok(db.getSessionStats(oldSid) !== null, "old session should exist");
-    assert.ok(db.getResume(oldSid) !== null, "old resume should exist");
+    assert.ok((await store.getSessionStats(oldSid)) !== null, "old session should exist");
+    assert.ok((await store.getResume(oldSid)) !== null, "old resume should exist");
 
     // --- Phase 2: Simulate startup cleanup (with generous age so fresh sessions survive) ---
-    // Fresh sessions should NOT be cleaned up with maxAgeDays=7
-    const deletedCount = db.cleanupOldSessions(7);
+    const deletedCount = await store.cleanupOldSessions(7);
     assert.equal(deletedCount, 0, "fresh sessions should not be cleaned up");
 
     // Old session should still exist (it was just created)
-    assert.ok(db.getSessionStats(oldSid) !== null, "old session should survive fresh cleanup");
+    assert.ok((await store.getSessionStats(oldSid)) !== null, "old session should survive fresh cleanup");
 
     // --- Phase 3: Create a new "current" session ---
     const currentSid = "current-session";
-    db.ensureSession(currentSid, "/project/current");
+    await store.ensureSession(currentSid, "/project/current");
 
-    db.insertEvent(currentSid, {
+    await store.insertEvent(currentSid, {
       type: "file",
       category: "file",
       data: "/project/current/app.ts",
       priority: 1,
     }, "PostToolUse");
-    db.insertEvent(currentSid, {
+    await store.insertEvent(currentSid, {
       type: "cwd",
       category: "cwd",
       data: "/project/current",
@@ -224,50 +224,50 @@ describe("4. SessionStart Lifecycle", () => {
     }, "PostToolUse");
 
     // --- Phase 4: Simulate compact -- build snapshot and upsert resume ---
-    const currentEvents = db.getEvents(currentSid);
+    const currentEvents = await store.getEvents(currentSid);
     const snapshot = buildResumeSnapshot(currentEvents);
-    db.upsertResume(currentSid, snapshot, currentEvents.length);
-    db.incrementCompactCount(currentSid);
+    await store.upsertResume(currentSid, snapshot, currentEvents.length);
+    await store.incrementCompactCount(currentSid);
 
     // Verify resume is retrievable
-    const resume = db.getResume(currentSid);
+    const resume = await store.getResume(currentSid);
     assert.ok(resume !== null, "current resume should exist after compact");
     assert.equal(resume!.consumed, 0, "current resume should not be consumed");
     assert.equal(resume!.event_count, currentEvents.length, "event count should match");
 
     // Verify compact count incremented
-    const stats = db.getSessionStats(currentSid);
+    const stats = await store.getSessionStats(currentSid);
     assert.equal(stats!.compact_count, 1, "compact_count should be 1");
 
     // --- Phase 5: Simulate resume/continue -- consume the resume ---
-    db.markResumeConsumed(currentSid);
-    const consumedResume = db.getResume(currentSid);
+    await store.markResumeConsumed(currentSid);
+    const consumedResume = await store.getResume(currentSid);
     assert.equal(consumedResume!.consumed, 1, "resume should be consumed after SessionStart");
 
     // After consumption, a subsequent SessionStart should see consumed=1 (noop)
-    const secondCheck = db.getResume(currentSid);
+    const secondCheck = await store.getResume(currentSid);
     assert.equal(secondCheck!.consumed, 1, "resume should still be consumed on re-check");
   });
 
-  test("deleteSession fully removes old session data", () => {
-    const db = createTestDB();
+  test("deleteSession fully removes old session data", async () => {
+    const store = await createTestStore();
     const sid = "to-delete";
-    db.ensureSession(sid, "/project");
-    db.insertEvent(sid, {
+    await store.ensureSession(sid, "/project");
+    await store.insertEvent(sid, {
       type: "file",
       category: "file",
       data: "/project/file.ts",
       priority: 1,
     }, "PostToolUse");
-    db.upsertResume(sid, "<session_resume>snapshot</session_resume>", 1);
+    await store.upsertResume(sid, "<session_resume>snapshot</session_resume>", 1);
 
     // Delete it
-    db.deleteSession(sid);
+    await store.deleteSession(sid);
 
     // Verify all traces are gone
-    assert.equal(db.getEventCount(sid), 0, "events should be gone");
-    assert.equal(db.getSessionStats(sid), null, "meta should be gone");
-    assert.equal(db.getResume(sid), null, "resume should be gone");
+    assert.equal(await store.getEventCount(sid), 0, "events should be gone");
+    assert.equal(await store.getSessionStats(sid), null, "meta should be gone");
+    assert.equal(await store.getResume(sid), null, "resume should be gone");
   });
 });
 
@@ -276,15 +276,14 @@ describe("4. SessionStart Lifecycle", () => {
 // ════════════════════════════════════════════
 
 describe("5. Budget Constraint Under Stress", () => {
-  test("budget constraint: 100+ events still produce snapshot <= 2048 bytes", () => {
-    const db = createTestDB();
+  test("budget constraint: 100+ events still produce snapshot <= 2048 bytes", async () => {
+    const store = await createTestStore();
     const sid = `stress-${randomUUID()}`;
-    db.ensureSession(sid, "/project");
+    await store.ensureSession(sid, "/project");
 
-    // Insert 50 file events -- data_hash is first 16 hex chars (= first 8 bytes of data),
-    // so each data string must differ in its first 8 characters to avoid dedup.
+    // Insert 50 file events
     for (let i = 0; i < 50; i++) {
-      db.insertEvent(sid, {
+      await store.insertEvent(sid, {
         type: "file",
         category: "file",
         data: `${randomUUID()}/component.tsx`,
@@ -292,9 +291,9 @@ describe("5. Budget Constraint Under Stress", () => {
       }, "PostToolUse");
     }
 
-    // Insert 20 task events -- UUID prefix ensures unique hash
+    // Insert 20 task events
     for (let i = 0; i < 20; i++) {
-      db.insertEvent(sid, {
+      await store.insertEvent(sid, {
         type: "task",
         category: "task",
         data: `${randomUUID()} implement feature`,
@@ -302,9 +301,9 @@ describe("5. Budget Constraint Under Stress", () => {
       }, "PostToolUse");
     }
 
-    // Insert 15 rule events -- UUID prefix ensures unique hash
+    // Insert 15 rule events
     for (let i = 0; i < 15; i++) {
-      db.insertEvent(sid, {
+      await store.insertEvent(sid, {
         type: "rule",
         category: "rule",
         data: `${randomUUID()} always follow convention`,
@@ -312,9 +311,9 @@ describe("5. Budget Constraint Under Stress", () => {
       }, "PostToolUse");
     }
 
-    // Insert 10 error events -- UUID prefix ensures unique hash
+    // Insert 10 error events
     for (let i = 0; i < 10; i++) {
-      db.insertEvent(sid, {
+      await store.insertEvent(sid, {
         type: "error_tool",
         category: "error",
         data: `${randomUUID()} module not found`,
@@ -322,9 +321,9 @@ describe("5. Budget Constraint Under Stress", () => {
       }, "PostToolUse");
     }
 
-    // Insert 5 decision events -- UUID prefix ensures unique hash
+    // Insert 5 decision events
     for (let i = 0; i < 5; i++) {
-      db.insertEvent(sid, {
+      await store.insertEvent(sid, {
         type: "decision",
         category: "decision",
         data: `${randomUUID()} use approach`,
@@ -333,17 +332,17 @@ describe("5. Budget Constraint Under Stress", () => {
     }
 
     // Insert env, cwd, git events
-    db.insertEvent(sid, { type: "cwd", category: "cwd", data: "/project/src", priority: 2 }, "PostToolUse");
-    db.insertEvent(sid, { type: "git", category: "git", data: "branch", priority: 2 }, "PostToolUse");
-    db.insertEvent(sid, { type: "env", category: "env", data: "nvm use 20", priority: 2 }, "PostToolUse");
-    db.insertEvent(sid, { type: "intent", category: "intent", data: "implement", priority: 4 }, "PostToolUse");
+    await store.insertEvent(sid, { type: "cwd", category: "cwd", data: "/project/src", priority: 2 }, "PostToolUse");
+    await store.insertEvent(sid, { type: "git", category: "git", data: "branch", priority: 2 }, "PostToolUse");
+    await store.insertEvent(sid, { type: "env", category: "env", data: "nvm use 20", priority: 2 }, "PostToolUse");
+    await store.insertEvent(sid, { type: "intent", category: "intent", data: "implement", priority: 4 }, "PostToolUse");
 
     // Total: 50 + 20 + 15 + 10 + 5 + 3 + 1 = 104 events
-    const totalEvents = db.getEventCount(sid);
+    const totalEvents = await store.getEventCount(sid);
     assert.ok(totalEvents >= 100, `expected >= 100 events, got ${totalEvents}`);
 
     // Build snapshot
-    const storedEvents = db.getEvents(sid);
+    const storedEvents = await store.getEvents(sid);
     const snapshot = buildResumeSnapshot(storedEvents);
 
     // Verify budget
@@ -353,7 +352,7 @@ describe("5. Budget Constraint Under Stress", () => {
     // Verify valid XML structure
     assert.ok(snapshot.startsWith("<session_resume"), "should start with <session_resume");
     assert.ok(snapshot.endsWith("</session_resume>"), "should end with </session_resume>");
-  });
+  }, 120_000); // Allow extra time for 104 ES operations
 });
 
 // ════════════════════════════════════════════
@@ -373,13 +372,13 @@ describe("6. Empty Session Snapshot", () => {
     assert.ok(snapshot.endsWith("</session_resume>"), "should end with </session_resume>");
   });
 
-  test("empty session from DB: getEvents returns empty, snapshot still valid", () => {
-    const db = createTestDB();
+  test("empty session from store: getEvents returns empty, snapshot still valid", async () => {
+    const store = await createTestStore();
     const sid = `empty-${randomUUID()}`;
-    db.ensureSession(sid, "/project");
+    await store.ensureSession(sid, "/project");
 
     // No events inserted
-    const storedEvents = db.getEvents(sid);
+    const storedEvents = await store.getEvents(sid);
     assert.equal(storedEvents.length, 0, "should have 0 events");
 
     const snapshot = buildResumeSnapshot(storedEvents);
@@ -389,8 +388,8 @@ describe("6. Empty Session Snapshot", () => {
     assert.ok(snapshot.endsWith("</session_resume>"), "should end with </session_resume>");
 
     // Even an empty snapshot can be upserted and consumed
-    db.upsertResume(sid, snapshot, 0);
-    const resume = db.getResume(sid);
+    await store.upsertResume(sid, snapshot, 0);
+    const resume = await store.getResume(sid);
     assert.ok(resume !== null, "empty resume should be stored");
     assert.equal(resume!.event_count, 0, "event_count should be 0");
   });

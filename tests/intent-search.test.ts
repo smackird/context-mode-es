@@ -1,17 +1,18 @@
 /**
  * Intent Search vs Smart Truncation — Comparative Test
  *
- * Proves that intent-driven FTS5 search outperforms naive 60/40 head/tail
+ * Proves that intent-driven ES search outperforms naive 60/40 head/tail
  * truncation for finding specific information buried in large output.
  *
  * Smart truncation keeps the first 60% and last 40% of bytes, dropping
- * the middle. Intent search indexes the full content via ContentStore
+ * the middle. Intent search indexes the full content via ContentStoreES
  * and retrieves only the chunks matching the user's intent.
  */
 
 import { strict as assert } from "node:assert";
-import { describe, test } from "vitest";
-import { ContentStore } from "../src/store.js";
+import { afterAll, describe, test } from "vitest";
+import { createTestContentStore, cleanupIndex, refreshIndex } from "./shared/es-test-helpers.js";
+import { ContentStoreES } from "../src/store-es.js";
 
 // ─────────────────────────────────────────────────────────
 // Smart Truncation simulation (60% head + 40% tail)
@@ -45,23 +46,20 @@ function simulateSmartTruncation(raw: string, max: number): string {
 }
 
 // ─────────────────────────────────────────────────────────
-// Intent Search simulation (ContentStore + FTS5 BM25)
+// Intent Search simulation (ContentStoreES + Elasticsearch)
 // ─────────────────────────────────────────────────────────
 
-function simulateIntentSearch(
+async function simulateIntentSearch(
   content: string,
   intent: string,
   maxResults: number = 5,
-): { found: string; bytes: number } {
-  const store = new ContentStore(":memory:");
-  try {
-    store.indexPlainText(content, "test-output");
-    const results = store.search(intent, maxResults);
-    const text = results.map((r) => r.content).join("\n\n");
-    return { found: text, bytes: Buffer.byteLength(text) };
-  } finally {
-    store.close();
-  }
+): Promise<{ found: string; bytes: number; indexName: string }> {
+  const { store, indexName } = await createTestContentStore();
+  await store.indexPlainText(content, "test-output");
+  await refreshIndex(indexName);
+  const results = await store.search(intent, maxResults);
+  const text = results.map((r) => r.content).join("\n\n");
+  return { found: text, bytes: Buffer.byteLength(text), indexName };
 }
 
 // ─────────────────────────────────────────────────────────
@@ -84,12 +82,21 @@ interface ScenarioResult {
 
 const scenarioResults: ScenarioResult[] = [];
 
+// Track all index names for cleanup
+const indexNames: string[] = [];
+
+afterAll(async () => {
+  for (const name of indexNames) {
+    await cleanupIndex(name);
+  }
+});
+
 // ─────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────
 
 describe("Scenario 1: Server Log Error (line 347 of 500)", () => {
-  test("server log: intent search finds error buried in middle", () => {
+  test("server log: intent search finds error buried in middle", async () => {
     const lines: string[] = [];
     for (let i = 0; i < 500; i++) {
       if (i === 346) {
@@ -113,10 +120,11 @@ describe("Scenario 1: Server Log Error (line 347 of 500)", () => {
       .includes("connection refused");
 
     // Intent search
-    const intentResult = simulateIntentSearch(
+    const intentResult = await simulateIntentSearch(
       logContent,
       "connection refused database error",
     );
+    indexNames.push(intentResult.indexName);
     const intentFoundError = intentResult.found
       .toLowerCase()
       .includes("connection refused");
@@ -138,7 +146,7 @@ describe("Scenario 1: Server Log Error (line 347 of 500)", () => {
 });
 
 describe("Scenario 2: Test Failures (3 among 200 tests)", () => {
-  test("test results: intent search finds all 3 failures", () => {
+  test("test results: intent search finds all 3 failures", async () => {
     const failureLines: Record<number, string> = {
       67: "  \u2717 AuthSuite::testTokenExpiry FAILED - Expected 401 but got 200",
       134: "  \u2717 PaymentSuite::testRefundFlow FAILED - Expected 'refunded' but got 'pending'",
@@ -165,10 +173,11 @@ describe("Scenario 2: Test Failures (3 among 200 tests)", () => {
     if (truncated.includes("testFuzzyMatch")) truncationFailCount++;
 
     // Intent search — use terms that actually appear in the failure lines
-    const intentResult = simulateIntentSearch(
+    const intentResult = await simulateIntentSearch(
       testOutput,
       "FAILED Expected but got",
     );
+    indexNames.push(intentResult.indexName);
     let intentFailCount = 0;
     if (intentResult.found.includes("testTokenExpiry")) intentFailCount++;
     if (intentResult.found.includes("testRefundFlow")) intentFailCount++;
@@ -192,7 +201,7 @@ describe("Scenario 2: Test Failures (3 among 200 tests)", () => {
 });
 
 describe("Scenario 3: Build Warnings (2 among 300 lines)", () => {
-  test("build output: intent search finds both deprecation warnings", () => {
+  test("build output: intent search finds both deprecation warnings", async () => {
     const lines: string[] = [];
     for (let i = 0; i < 300; i++) {
       if (i === 88) {
@@ -219,10 +228,11 @@ describe("Scenario 3: Build Warnings (2 among 300 lines)", () => {
     if (truncated.includes("'request'")) truncationWarningCount++;
 
     // Intent search
-    const intentResult = simulateIntentSearch(
+    const intentResult = await simulateIntentSearch(
       buildOutput,
       "WARNING deprecated",
     );
+    indexNames.push(intentResult.indexName);
     let intentWarningCount = 0;
     if (intentResult.found.includes("left-pad")) intentWarningCount++;
     if (intentResult.found.includes("'request'")) intentWarningCount++;
@@ -245,7 +255,7 @@ describe("Scenario 3: Build Warnings (2 among 300 lines)", () => {
 });
 
 describe("Scenario 4: API Auth Error (line 743 of 1000)", () => {
-  test("API response: intent search finds authentication error", () => {
+  test("API response: intent search finds authentication error", async () => {
     const lines: string[] = [];
     for (let i = 0; i < 1000; i++) {
       if (i === 742) {
@@ -269,10 +279,11 @@ describe("Scenario 4: API Auth Error (line 743 of 1000)", () => {
       .includes("authentication failed");
 
     // Intent search
-    const intentResult = simulateIntentSearch(
+    const intentResult = await simulateIntentSearch(
       apiResponse,
       "authentication failed token expired",
     );
+    indexNames.push(intentResult.indexName);
     const intentFoundAuth = intentResult.found
       .toLowerCase()
       .includes("authentication failed");
@@ -294,7 +305,7 @@ describe("Scenario 4: API Auth Error (line 743 of 1000)", () => {
 });
 
 describe("Scenario 5: Score-based search finds sections matching later intent words", () => {
-  test("score-based search: multi-word matches rank higher than single-word matches", () => {
+  test("score-based search: multi-word matches rank higher than single-word matches", async () => {
     // Build a 500-line synthetic changelog/advisory output.
     // Three relevant sections are scattered across the document:
     //   Lines 100-120: prototype-related code change (hasOwnProperty, allowPrototypes)
@@ -358,8 +369,9 @@ describe("Scenario 5: Score-based search finds sections matching later intent wo
     // matching just "security" or "fix" (which appear in filler lines too).
     const intent = "security vulnerability prototype pollution fix";
 
-    // Score-based intent search: BM25 ranks chunks matching MORE intent words higher
-    const intentResult = simulateIntentSearch(changelogOutput, intent, 5);
+    // Score-based intent search: Elasticsearch ranks chunks matching MORE intent words higher
+    const intentResult = await simulateIntentSearch(changelogOutput, intent, 5);
+    indexNames.push(intentResult.indexName);
 
     // Check which of the three important sections were found
     const foundPrototypeFix = intentResult.found.includes("Object.prototype.hasOwnProperty")
@@ -384,13 +396,13 @@ describe("Scenario 5: Score-based search finds sections matching later intent wo
     });
 
     // The score-based search MUST find at least 2 of the 3 relevant sections.
-    // BM25 scoring ensures sections matching multiple intent words
+    // Elasticsearch scoring ensures sections matching multiple intent words
     // (e.g., "prototype" + "pollution" + "security" + "fix") rank higher
     // than filler lines matching just one word like "fix".
     assert.ok(
       relevantSectionsFound >= 2,
       `Score-based search should find at least 2/3 relevant sections, found ${relevantSectionsFound}/3. ` +
-      `BM25 should rank multi-word matches above single-word filler matches.`,
+      `Elasticsearch should rank multi-word matches above single-word filler matches.`,
     );
 
     // The prototype pollution fix section (Section A) is the highest-value result
@@ -399,7 +411,7 @@ describe("Scenario 5: Score-based search finds sections matching later intent wo
     assert.ok(
       foundPrototypeFix,
       "Score-based search MUST find the 'Prototype Pollution Fix' section — " +
-      "it matches 4 intent words and should rank highest via BM25.",
+      "it matches 4 intent words and should rank highest via Elasticsearch.",
     );
   });
 });

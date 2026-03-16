@@ -261,20 +261,21 @@ export class VSCodeCopilotAdapter implements HookAdapter {
     return join(this.getSessionDir(), `${hash}.db`);
   }
 
+  getIndexPlatformId(): string {
+    return "vscode-copilot";
+  }
+
+  getSessionIndexName(projectDir: string): string {
+    const hash = computeProjectHash(projectDir);
+    return buildSessionIndexName("vscode-copilot", hash);
+  }
+
   getSessionEventsPath(projectDir: string): string {
     const hash = createHash("sha256")
       .update(projectDir)
       .digest("hex")
       .slice(0, 16);
     return join(this.getSessionDir(), `${hash}-events.md`);
-  }
-
-  getIndexPlatformId(): string {
-    return "vscode-copilot";
-  }
-
-  getSessionIndexName(projectDir: string): string {
-    return buildSessionIndexName(this.getIndexPlatformId(), computeProjectHash(projectDir));
   }
 
   generateHookConfig(pluginRoot: string): HookRegistration {

@@ -3,7 +3,7 @@
  *
  * Tests the full subagent context protection pipeline:
  * 1. Hook injection: pretooluse.mjs injects OUTPUT FORMAT into Task prompts
- * 2. Shared KB: subagent index() → main agent search() via same ContentStore
+ * 2. Shared KB: subagent index() → main agent search() via same ContentStoreES
  * 3. LLM compliance: real subagent respects word budget (requires `claude` CLI)
  *
  * Run: npx vitest tests/subagent-budget.test.ts
@@ -14,8 +14,9 @@ import { strict as assert } from "node:assert";
 import { spawnSync, execSync } from "node:child_process";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, test } from "vitest";
-import { ContentStore } from "../src/store.js";
+import { describe, test, afterAll } from "vitest";
+import { createTestContentStore, cleanupIndex, refreshIndex } from "./shared/es-test-helpers.js";
+import { ContentStoreES } from "../src/store-es.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const HOOK_PATH = join(__dirname, "..", "hooks", "pretooluse.mjs");
@@ -160,12 +161,21 @@ describe("Hook Injection", () => {
 });
 
 describe("Shared Knowledge Base (subagent -> main)", () => {
-  test("subagent index() is visible to main agent search()", () => {
-    // Same ContentStore instance = same as shared MCP server process
-    const store = new ContentStore(":memory:");
+  const indexNames: string[] = [];
+
+  afterAll(async () => {
+    for (const idx of indexNames) {
+      await cleanupIndex(idx);
+    }
+  });
+
+  test("subagent index() is visible to main agent search()", async () => {
+    // Same ContentStoreES instance = same as shared MCP server process
+    const { store, indexName } = await createTestContentStore();
+    indexNames.push(indexName);
 
     // Simulate subagent indexing its research
-    store.index({
+    await store.index({
       content: [
         "# Zod Overview",
         "TypeScript-first schema validation library.",
@@ -182,75 +192,77 @@ describe("Shared Knowledge Base (subagent -> main)", () => {
       source: "subagent:zod-research",
     });
 
+    await refreshIndex(indexName);
+
     // Simulate main agent searching subagent's indexed content
-    const results = store.search("weekly downloads", 1, "zod-research");
+    const results = await store.search("weekly downloads", 1, "zod-research");
     assert.ok(results.length > 0, "Main should find subagent's indexed content");
     assert.ok(
       results[0].content.includes("98M"),
       "Should retrieve exact data from subagent's index",
     );
 
-    const apiResults = store.search("parse validation", 1, "zod-research");
+    const apiResults = await store.search("parse validation", 1, "zod-research");
     assert.ok(apiResults.length > 0, "Main should find API details");
     assert.ok(apiResults[0].content.includes(".parse()"), "Should find .parse() reference");
-
-    store.close();
   });
 
-  test("multiple subagents index into same KB with distinct sources", () => {
-    const store = new ContentStore(":memory:");
+  test("multiple subagents index into same KB with distinct sources", async () => {
+    const { store, indexName } = await createTestContentStore();
+    indexNames.push(indexName);
 
     // Subagent A indexes architecture research
-    store.index({
+    await store.index({
       content: "# Architecture\nMonorepo with pnpm workspaces. 15 packages.",
       source: "subagent-A:architecture",
     });
 
     // Subagent B indexes API research
-    store.index({
+    await store.index({
       content: "# API Endpoints\nREST + GraphQL. 47 endpoints total.",
       source: "subagent-B:api",
     });
 
     // Subagent C indexes contributor analysis
-    store.index({
+    await store.index({
       content: "# Contributors\nTop: @alice (312 commits), @bob (198 commits).",
       source: "subagent-C:contributors",
     });
 
+    await refreshIndex(indexName);
+
     // Main agent searches each subagent's findings by source
-    const arch = store.search("monorepo", 1, "subagent-A");
+    const arch = await store.search("monorepo", 1, "subagent-A");
     assert.ok(arch.length > 0 && arch[0].content.includes("pnpm"));
 
-    const api = store.search("endpoints", 1, "subagent-B");
+    const api = await store.search("endpoints", 1, "subagent-B");
     assert.ok(api.length > 0 && api[0].content.includes("47"));
 
-    const contrib = store.search("commits", 1, "subagent-C");
+    const contrib = await store.search("commits", 1, "subagent-C");
     assert.ok(contrib.length > 0 && contrib[0].content.includes("alice"));
 
     // Cross-search without source filter finds all (OR mode for cross-chunk terms)
-    const all = store.search("monorepo endpoints commits", 5, undefined, "OR");
+    const all = await store.search("monorepo endpoints commits", 5, undefined, "OR");
     assert.ok(all.length >= 2, "Global search should find results from multiple subagents");
-
-    store.close();
   });
 
-  test("main agent can search subagent KB after subagent is done", () => {
-    const store = new ContentStore(":memory:");
+  test("main agent can search subagent KB after subagent is done", async () => {
+    const { store, indexName } = await createTestContentStore();
+    indexNames.push(indexName);
 
-    // Subagent lifecycle: index → close (subagent done)
-    store.index({
+    // Subagent lifecycle: index → done
+    await store.index({
       content: "# Security Audit\nNo critical vulnerabilities found. 3 medium severity issues in auth module.",
       source: "subagent:security-audit",
     });
     // Subagent returns summary: "Indexed findings as 'subagent:security-audit'"
 
+    await refreshIndex(indexName);
+
     // Main agent picks up later and searches
-    const results = store.search("vulnerabilities auth", 1, "security-audit");
+    const results = await store.search("vulnerabilities auth", 1, "security-audit");
     assert.ok(results.length > 0);
     assert.ok(results[0].content.includes("3 medium severity"));
-
-    store.close();
   });
 });
 
@@ -296,6 +308,9 @@ describe("Context Budget Measurement", () => {
 });
 
 // Live LLM test — only runs when --live flag is passed
+// NOTE: This test spawns a subprocess using `claude` CLI which may internally
+// use ContentStore. If that subprocess needs ES migration, it should be handled
+// separately as it runs in its own process context.
 if (LIVE) {
   describe("Live LLM Test (claude -p)", () => {
     test("real subagent respects output budget", async () => {

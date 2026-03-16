@@ -54,7 +54,7 @@ git clone https://github.com/smackird/context-mode-es.git
 cd context-mode-es
 git checkout es-migration
 npm install
-npm run build
+npm run build && npm run bundle
 ```
 
 **Step 2 — Register as MCP server.** Run from your project directory:
@@ -68,8 +68,8 @@ Replace `/path/to/context-mode-es` with the actual path where you cloned the rep
 **Step 3 — Set up hooks** (for session continuity and routing enforcement):
 
 ```bash
-# From your project directory, run the setup command:
-node /path/to/context-mode-es/build/cli.js setup
+# From your project directory, run the upgrade command:
+node /path/to/context-mode-es/cli.bundle.mjs upgrade
 ```
 
 This auto-configures:
@@ -103,7 +103,7 @@ git clone https://github.com/smackird/context-mode-es.git
 cd context-mode-es
 git checkout es-migration
 npm install
-npm run build
+npm run build && npm run bundle
 ```
 
 **Step 2 — Register the MCP server.** Add to `~/.codex/config.toml`:

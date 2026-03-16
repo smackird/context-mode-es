@@ -122,7 +122,7 @@ async function fetchLatestVersion(): Promise<string> {
   // racing with process.exit() teardown on Node.js v24+.
   return new Promise((resolve) => {
     const req = httpsRequest(
-      "https://registry.npmjs.org/context-mode/latest",
+      "https://raw.githubusercontent.com/smackird/context-mode-es/es-migration/package.json",
       { headers: { Connection: "close" } },
       (res) => {
         let raw = "";
@@ -442,10 +442,10 @@ async function upgrade() {
   const localVersion = getLocalVersion();
   const tmpDir = join(tmpdir(), `context-mode-upgrade-${Date.now()}`);
 
-  s.start("Cloning mksglu/context-mode");
+  s.start("Cloning smackird/context-mode-es (es-migration)");
   try {
     execSync(
-      `git clone --depth 1 https://github.com/mksglu/context-mode.git "${tmpDir}"`,
+      `git clone --depth 1 --branch es-migration https://github.com/smackird/context-mode-es.git "${tmpDir}"`,
       { stdio: "pipe", timeout: 30000 },
     );
     s.stop("Downloaded");

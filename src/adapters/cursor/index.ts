@@ -188,20 +188,21 @@ export class CursorAdapter implements HookAdapter {
     return join(this.getSessionDir(), `${hash}.db`);
   }
 
+  getIndexPlatformId(): string {
+    return "cursor";
+  }
+
+  getSessionIndexName(projectDir: string): string {
+    const hash = computeProjectHash(projectDir);
+    return buildSessionIndexName("cursor", hash);
+  }
+
   getSessionEventsPath(projectDir: string): string {
     const hash = createHash("sha256")
       .update(projectDir)
       .digest("hex")
       .slice(0, 16);
     return join(this.getSessionDir(), `${hash}-events.md`);
-  }
-
-  getIndexPlatformId(): string {
-    return "cursor";
-  }
-
-  getSessionIndexName(projectDir: string): string {
-    return buildSessionIndexName(this.getIndexPlatformId(), computeProjectHash(projectDir));
   }
 
   generateHookConfig(_pluginRoot: string): HookRegistration {

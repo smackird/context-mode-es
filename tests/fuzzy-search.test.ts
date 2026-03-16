@@ -1,38 +1,34 @@
 /**
- * Fuzzy Search — TDD Red Phase
+ * Fuzzy Search — ES Migration
  *
- * Tests for the three-layer search fallback:
- *   Layer 1: Porter stemming (existing FTS5 MATCH)
- *   Layer 2: Trigram substring matching (new FTS5 trigram table)
- *   Layer 3: Fuzzy correction (Levenshtein distance)
+ * Tests for the three-layer search fallback in ContentStoreES:
+ *   Layer 1: Stemmed AND (most precise, multi_match with operator AND)
+ *   Layer 2: Fuzzy stemmed OR (fuzziness:AUTO on standard fields)
+ *   Layer 3: Fuzzy ngram OR (fuzziness:AUTO on ngram fields)
  *
- * These tests define the API contract BEFORE implementation.
- * All fuzzy-specific tests should FAIL until the feature is built.
+ * D-02: fuzzyCorrect() always returns null in ES (no vocabulary table;
+ *       ES fuzziness:AUTO replaces Levenshtein correction).
+ * D-02: searchTrigram uses ngram tokenizer which doesn't span word
+ *       boundaries like FTS5 trigram — some cross-word tests adjusted.
  */
 
-import { describe, test, expect } from "vitest";
+import { describe, test, expect, afterAll } from "vitest";
 import { strict as assert } from "node:assert";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { ContentStore } from "../src/store.js";
-
-function createStore(): ContentStore {
-  const path = join(
-    tmpdir(),
-    `context-mode-fuzzy-test-${Date.now()}-${Math.random().toString(36).slice(2)}.db`,
-  );
-  return new ContentStore(path);
-}
+import { createTestContentStore, cleanupIndex, refreshIndex } from "./shared/es-test-helpers.js";
+import { ContentStoreES } from "../src/store-es.js";
 
 /**
  * Seed a store with realistic multi-topic content for fuzzy search testing.
- * Returns the store with indexed content covering authentication, caching,
- * database, WebSocket, and deployment topics.
+ * Returns the store and indexName with indexed content covering authentication,
+ * caching, React hooks, WebSocket, and deployment topics.
  */
-function createSeededStore(): ContentStore {
-  const store = createStore();
+async function createSeededStore(): Promise<{
+  store: ContentStoreES;
+  indexName: string;
+}> {
+  const { store, indexName } = await createTestContentStore();
 
-  store.index({
+  await store.index({
     content: [
       "# Authentication",
       "",
@@ -52,7 +48,7 @@ function createSeededStore(): ContentStore {
     source: "Auth docs",
   });
 
-  store.index({
+  await store.index({
     content: [
       "# Caching Strategy",
       "",
@@ -67,7 +63,7 @@ function createSeededStore(): ContentStore {
     source: "Caching docs",
   });
 
-  store.index({
+  await store.index({
     content: [
       "# React Hooks",
       "",
@@ -96,7 +92,7 @@ function createSeededStore(): ContentStore {
     source: "React docs",
   });
 
-  store.index({
+  await store.index({
     content: [
       "# WebSocket Server",
       "",
@@ -111,7 +107,7 @@ function createSeededStore(): ContentStore {
     source: "WebSocket docs",
   });
 
-  store.index({
+  await store.index({
     content: [
       "# Deployment",
       "",
@@ -126,53 +122,64 @@ function createSeededStore(): ContentStore {
     source: "Deployment docs",
   });
 
-  return store;
+  await refreshIndex(indexName);
+
+  return { store, indexName };
 }
 
 describe("searchTrigram: Substring Matching", () => {
-  test("searchTrigram: finds substring match ('authenticat' → authentication)", () => {
-    const store = createSeededStore();
+  const indexes: string[] = [];
+
+  afterAll(async () => {
+    for (const idx of indexes) {
+      await cleanupIndex(idx);
+    }
+  });
+
+  test("searchTrigram: finds substring match ('authenticat' → authentication)", async () => {
+    const { store, indexName } = await createSeededStore();
+    indexes.push(indexName);
     // "authenticat" is a partial substring of "authentication"
-    // Porter stemming won't match this — trigram should
-    const results = store.searchTrigram("authenticat", 3);
+    // Porter stemming won't match this — ngram should
+    const results = await store.searchTrigram("authenticat", 3);
     assert.ok(results.length > 0, "Trigram should find substring match");
     assert.ok(
       results[0].content.toLowerCase().includes("authentication"),
       `Result should contain 'authentication', got: ${results[0].content.slice(0, 100)}`,
     );
-    store.close();
   });
 
-  test("searchTrigram: finds partial hyphenated term ('row-level' → row-level-security)", () => {
-    const store = createSeededStore();
+  test("searchTrigram: finds partial hyphenated term ('row-level' → row-level-security)", async () => {
+    const { store, indexName } = await createSeededStore();
+    indexes.push(indexName);
     // Partial match on hyphenated compound term
-    const results = store.searchTrigram("row-level", 3);
+    const results = await store.searchTrigram("row-level", 3);
     assert.ok(results.length > 0, "Trigram should match partial hyphenated terms");
     assert.ok(
       results[0].content.toLowerCase().includes("row-level-security") ||
         results[0].content.toLowerCase().includes("row-level"),
       `Result should contain row-level content, got: ${results[0].content.slice(0, 100)}`,
     );
-    store.close();
   });
 
-  test("searchTrigram: finds camelCase substring ('useEff' → useEffect)", () => {
-    const store = createSeededStore();
-    // "useEff" is a prefix of "useEffect" — trigram should match
-    const results = store.searchTrigram("useEff", 3);
+  test("searchTrigram: finds camelCase substring ('useEff' → useEffect)", async () => {
+    const { store, indexName } = await createSeededStore();
+    indexes.push(indexName);
+    // "useEff" is a prefix of "useEffect" — ngram should match
+    const results = await store.searchTrigram("useEff", 3);
     assert.ok(results.length > 0, "Trigram should match camelCase substrings");
     assert.ok(
       results[0].content.includes("useEffect"),
       `Result should contain 'useEffect', got: ${results[0].content.slice(0, 100)}`,
     );
-    store.close();
   });
 
-  test("searchTrigram: respects source filter", () => {
-    const store = createSeededStore();
+  test("searchTrigram: respects source filter", async () => {
+    const { store, indexName } = await createSeededStore();
+    indexes.push(indexName);
     // "cache" appears in both "Caching docs" and potentially elsewhere
-    const allResults = store.searchTrigram("cache", 10);
-    const filteredResults = store.searchTrigram("cache", 10, "Caching");
+    const allResults = await store.searchTrigram("cache", 10);
+    const filteredResults = await store.searchTrigram("cache", 10, "Caching");
     assert.ok(filteredResults.length > 0, "Should find results with source filter");
     assert.ok(
       filteredResults.every((r) => r.source.includes("Caching")),
@@ -183,90 +190,91 @@ describe("searchTrigram: Substring Matching", () => {
       filteredResults.length <= allResults.length,
       "Filtered results should be <= all results",
     );
-    store.close();
   });
 });
 
 describe("fuzzyCorrect: Levenshtein Typo Correction", () => {
-  test("fuzzyCorrect: corrects single typo ('autentication' → 'authentication')", () => {
-    const store = createSeededStore();
-    // Missing 'h' — edit distance 1
-    const corrected = store.fuzzyCorrect("autentication");
-    assert.ok(corrected !== null, "Should return a correction for single typo");
-    assert.equal(
-      corrected,
-      "authentication",
-      `Should correct to 'authentication', got: '${corrected}'`,
-    );
-    store.close();
+  const indexes: string[] = [];
+
+  afterAll(async () => {
+    for (const idx of indexes) {
+      await cleanupIndex(idx);
+    }
   });
 
-  test("fuzzyCorrect: returns null for exact match (no correction needed)", () => {
-    const store = createSeededStore();
-    // Exact word exists in vocabulary — no correction needed
+  // D-02: fuzzyCorrect() always returns null in ES — no vocabulary table.
+  // ES uses fuzziness:AUTO in searchWithFallback instead.
+
+  test("fuzzyCorrect: always returns null in ES (no vocabulary table)", async () => {
+    const { store, indexName } = await createSeededStore();
+    indexes.push(indexName);
+    // In SQLite, this would correct to 'authentication'. In ES, always null.
+    const corrected = store.fuzzyCorrect("autentication");
+    assert.equal(
+      corrected,
+      null,
+      "fuzzyCorrect always returns null in ES (D-02: replaced by fuzziness:AUTO)",
+    );
+  });
+
+  test("fuzzyCorrect: returns null for exact match too (no vocabulary in ES)", async () => {
+    const { store, indexName } = await createSeededStore();
+    indexes.push(indexName);
     const corrected = store.fuzzyCorrect("authentication");
     assert.equal(
       corrected,
       null,
-      "Should return null when word already exists in vocabulary",
+      "fuzzyCorrect always returns null in ES, even for exact words",
     );
-    store.close();
   });
 
-  test("fuzzyCorrect: returns null for gibberish (too distant)", () => {
-    const store = createSeededStore();
-    // Completely unrelated — edit distance too high for any vocabulary word
+  test("fuzzyCorrect: returns null for gibberish (same as SQLite)", async () => {
+    const { store, indexName } = await createSeededStore();
+    indexes.push(indexName);
     const corrected = store.fuzzyCorrect("xyzqwertymno");
     assert.equal(
       corrected,
       null,
       "Should return null when no close match exists",
     );
-    store.close();
   });
 });
 
 describe("searchWithFallback: Three-Layer Cascade", () => {
-  test("searchWithFallback: Layer 1 hit (Porter) — exact stemmed match", () => {
-    const store = createSeededStore();
-    // "caching" stems to "cach" via Porter — Layer 1 should match directly
-    const results = store.searchWithFallback("caching strategy", 3);
-    assert.ok(results.length > 0, "Layer 1 (Porter) should find stemmed match");
+  const indexes: string[] = [];
+
+  afterAll(async () => {
+    for (const idx of indexes) {
+      await cleanupIndex(idx);
+    }
+  });
+
+  // ES cascade: Attempt 1 stemmed AND → Attempt 2 fuzzy stemmed OR → Attempt 3 fuzzy ngram OR
+
+  test("searchWithFallback: Attempt 1 hit (stemmed AND) — exact stemmed match", async () => {
+    const { store, indexName } = await createSeededStore();
+    indexes.push(indexName);
+    // "caching strategy" — both terms exist in same doc, stemmed AND should match
+    const results = await store.searchWithFallback("caching strategy", 3);
+    assert.ok(results.length > 0, "Attempt 1 (stemmed AND) should find stemmed match");
     assert.ok(
       results[0].content.toLowerCase().includes("cach"),
       `First result should be about caching, got: ${results[0].content.slice(0, 100)}`,
     );
-    // Verify it used Layer 1 (fastest path)
     assert.equal(
       results[0].matchLayer,
       "porter",
       `Should report 'porter' as match layer, got: '${results[0].matchLayer}'`,
     );
-    store.close();
   });
 
-  test("searchWithFallback: Layer 2 hit (Trigram) — partial substring", () => {
-    const store = createSeededStore();
-    // "connectionPo" is a partial camelCase — Porter won't match, trigram will
-    const results = store.searchWithFallback("connectionPo", 3);
-    assert.ok(results.length > 0, "Layer 2 (Trigram) should find substring match");
-    assert.ok(
-      results[0].content.includes("connectionPool"),
-      `Result should contain 'connectionPool', got: ${results[0].content.slice(0, 100)}`,
-    );
-    assert.equal(
-      results[0].matchLayer,
-      "trigram",
-      `Should report 'trigram' as match layer, got: '${results[0].matchLayer}'`,
-    );
-    store.close();
-  });
-
-  test("searchWithFallback: Layer 3 hit (Fuzzy) — typo correction", () => {
-    const store = createSeededStore();
+  test("searchWithFallback: Attempt 2 hit (fuzzy stemmed OR) — typo correction", async () => {
+    const { store, indexName } = await createSeededStore();
+    indexes.push(indexName);
     // "kuberntes" is a typo for "kubernetes" (missing 'e')
-    const results = store.searchWithFallback("kuberntes", 3);
-    assert.ok(results.length > 0, "Layer 3 (Fuzzy) should find typo-corrected match");
+    // Stemmed AND won't match, but fuzzy stemmed OR with fuzziness:AUTO should
+    const results = await store.searchWithFallback("kuberntes", 3);
+    assert.ok(results.length > 0, "Attempt 2 (fuzzy) should find typo-corrected match");
     assert.ok(
       results[0].content.toLowerCase().includes("kubernetes"),
       `Result should contain 'kubernetes', got: ${results[0].content.slice(0, 100)}`,
@@ -276,65 +284,87 @@ describe("searchWithFallback: Three-Layer Cascade", () => {
       "fuzzy",
       `Should report 'fuzzy' as match layer, got: '${results[0].matchLayer}'`,
     );
-    store.close();
   });
 
-  test("searchWithFallback: no match at any layer returns empty", () => {
-    const store = createSeededStore();
-    // Completely unrelated term with no substring or fuzzy match
-    const results = store.searchWithFallback("xylophoneQuartzMango", 3);
+  test("searchWithFallback: Attempt 3 hit (fuzzy ngram OR) — partial substring with typo", async () => {
+    const { store, indexName } = await createSeededStore();
+    indexes.push(indexName);
+    // "connectionPo" is a partial camelCase — stemmed AND won't match,
+    // fuzzy stemmed OR may not match, fuzzy ngram OR should catch it
+    const results = await store.searchWithFallback("connectionPo", 3);
+    assert.ok(results.length > 0, "Attempt 3 (fuzzy ngram) should find substring match");
+    assert.ok(
+      results[0].content.includes("connectionPool"),
+      `Result should contain 'connectionPool', got: ${results[0].content.slice(0, 100)}`,
+    );
+    // May resolve at fuzzy or trigram layer depending on ES analysis
+    assert.ok(
+      results[0].matchLayer === "fuzzy" || results[0].matchLayer === "trigram",
+      `Should report 'fuzzy' or 'trigram' as match layer, got: '${results[0].matchLayer}'`,
+    );
+  });
+
+  test("searchWithFallback: no match at any layer returns empty", async () => {
+    const { store, indexName } = await createSeededStore();
+    indexes.push(indexName);
+    // Use a truly unmatchable query (random UUID-like string) since ES fuzzy matching
+    // can be more aggressive than SQLite and may return low-relevance matches for word-like strings.
+    const results = await store.searchWithFallback("z9k7x4m2q8w1v3n6j5p0", 3);
     assert.equal(results.length, 0, "Should return empty when no layer matches");
-    store.close();
   });
 
-  test("searchWithFallback: source filter works across all layers", () => {
-    const store = createSeededStore();
+  test("searchWithFallback: source filter works across all layers", async () => {
+    const { store, indexName } = await createSeededStore();
+    indexes.push(indexName);
     // "JWT" exists in both Auth docs and Deployment docs (JWT_SECRET)
-    // With source filter, should only return Auth docs
-    const results = store.searchWithFallback("JWT", 5, "Auth");
+    const results = await store.searchWithFallback("JWT", 5, "Auth");
     assert.ok(results.length > 0, "Should find results with source filter");
     assert.ok(
       results.every((r) => r.source.includes("Auth")),
       `All results should be from Auth source, got: ${results.map((r) => r.source).join(", ")}`,
     );
-    store.close();
   });
 });
 
 describe("Edge Cases", () => {
-  test("searchTrigram: empty query returns empty", () => {
-    const store = createSeededStore();
-    const results = store.searchTrigram("", 3);
-    assert.equal(results.length, 0, "Empty query should return no results");
-    store.close();
-  });
+  const indexes: string[] = [];
 
-  test("searchTrigram: very short query (2 chars) still works", () => {
-    const store = createSeededStore();
-    // "JS" or "k8" — trigram needs at least 3 chars to form a trigram
-    // but the API should handle gracefully (return empty or degrade)
-    const results = store.searchTrigram("JS", 3);
-    // Should not throw, may return empty
-    assert.ok(Array.isArray(results), "Should return an array even for short query");
-    store.close();
-  });
-
-  test("fuzzyCorrect: handles multi-word query (corrects each word)", () => {
-    const store = createSeededStore();
-    // "autentication middlewre" — two typos
-    const corrected = store.fuzzyCorrect("autentication");
-    // At minimum, should correct the single word
-    if (corrected !== null) {
-      assert.equal(corrected, "authentication", "Should correct to closest match");
+  afterAll(async () => {
+    for (const idx of indexes) {
+      await cleanupIndex(idx);
     }
-    store.close();
   });
 
-  test("searchWithFallback: Layer 1 hit skips Layer 2 and 3 (performance)", () => {
-    const store = createSeededStore();
-    // "Redis" is an exact term — should resolve at Layer 1 only
+  test("searchTrigram: empty query returns empty", async () => {
+    const { store, indexName } = await createSeededStore();
+    indexes.push(indexName);
+    const results = await store.searchTrigram("", 3);
+    assert.equal(results.length, 0, "Empty query should return no results");
+  });
+
+  test("searchTrigram: very short query (2 chars) returns empty (ngram needs >= 3 chars)", async () => {
+    const { store, indexName } = await createSeededStore();
+    indexes.push(indexName);
+    // ES ngram tokenizer requires at least 3 chars; searchTrigram filters words < 3 chars
+    const results = await store.searchTrigram("JS", 3);
+    assert.ok(Array.isArray(results), "Should return an array even for short query");
+    assert.equal(results.length, 0, "2-char query filtered out by searchTrigram (< 3 chars)");
+  });
+
+  test("fuzzyCorrect: always returns null in ES (D-02)", async () => {
+    const { store, indexName } = await createSeededStore();
+    indexes.push(indexName);
+    // D-02: No vocabulary table in ES, fuzzyCorrect is a no-op stub
+    const corrected = store.fuzzyCorrect("autentication");
+    assert.equal(corrected, null, "fuzzyCorrect always returns null in ES");
+  });
+
+  test("searchWithFallback: Attempt 1 hit skips Attempt 2 and 3 (performance)", async () => {
+    const { store, indexName } = await createSeededStore();
+    indexes.push(indexName);
+    // "Redis" is an exact term — should resolve at Attempt 1 (stemmed AND)
     const start = performance.now();
-    const results = store.searchWithFallback("Redis", 3);
+    const results = await store.searchWithFallback("Redis", 3);
     const elapsed = performance.now() - start;
     assert.ok(results.length > 0, "Should find Redis content");
     assert.equal(
@@ -342,35 +372,36 @@ describe("Edge Cases", () => {
       "porter",
       "Exact match should resolve at Porter layer",
     );
-    // Sanity: should be fast since it didn't need trigram/fuzzy
-    assert.ok(elapsed < 500, `Should be fast for Layer 1 hit, took ${elapsed.toFixed(0)}ms`);
-    store.close();
+    // Sanity: should be reasonably fast since it didn't need fuzzy/ngram
+    assert.ok(elapsed < 2000, `Should be fast for Attempt 1 hit, took ${elapsed.toFixed(0)}ms`);
   });
 
-  test("trigram table is populated during index()", () => {
-    const store = createStore();
-    store.index({
+  test("ngram index is populated during index()", async () => {
+    const { store, indexName } = await createTestContentStore();
+    indexes.push(indexName);
+    await store.index({
       content: "# Test\n\nThe horizontalPodAutoscaler manages pod replicas.",
       source: "test-trigram-index",
     });
-    // After indexing, trigram search should work
-    const results = store.searchTrigram("horizontalPod", 3);
-    assert.ok(results.length > 0, "Trigram table should be populated during index()");
+    await refreshIndex(indexName);
+    // After indexing, trigram (ngram) search should work
+    const results = await store.searchTrigram("horizontalPod", 3);
+    assert.ok(results.length > 0, "Ngram index should be populated during index()");
     assert.ok(
       results[0].content.includes("horizontalPodAutoscaler"),
       "Should find the camelCase term",
     );
-    store.close();
   });
 
-  test("trigram table is populated during indexPlainText()", () => {
-    const store = createStore();
-    store.indexPlainText(
+  test("ngram index is populated during indexPlainText()", async () => {
+    const { store, indexName } = await createTestContentStore();
+    indexes.push(indexName);
+    await store.indexPlainText(
       "ERROR: connectionRefused on port 5432\nWARNING: retrying in 5s",
       "plain-text-trigram",
     );
-    const results = store.searchTrigram("connectionRef", 3);
+    await refreshIndex(indexName);
+    const results = await store.searchTrigram("connectionRef", 3);
     assert.ok(results.length > 0, "Trigram should work with indexPlainText content");
-    store.close();
   });
 });
